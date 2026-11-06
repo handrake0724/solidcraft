@@ -811,7 +811,7 @@ impl<'a> Tr<'a> {
                 for idx in 0..cnt {
                     pts.push(x.point(self.pt(seq, base_p + 3 * idx)?));
                 }
-                snap_poles(&mut pts, k1 + 1, k2 + 1, POLE_SNAP * self.tol);
+                snap_poles(&mut pts, k1 + 1, k2 + 1, self.tol, POLE_SNAP * self.tol);
                 let mut rows = Vec::new();
                 let mut wrows = Vec::new();
                 let mut rational = false;
@@ -1074,7 +1074,7 @@ impl<'a> Tr<'a> {
         for idx in 0..cnt {
             pts.push(x.point(self.pt(seq, base_p + 3 * idx)?));
         }
-        snap_poles(&mut pts, k1 + 1, k2 + 1, POLE_SNAP * self.tol);
+        snap_poles(&mut pts, k1 + 1, k2 + 1, self.tol, POLE_SNAP * self.tol);
         let h = |i: usize, j: usize| -> R<[f64; 4]> {
             let idx = j * (k1 + 1) + i;
             let w = self.n(seq, base_w + idx)?;
@@ -1107,14 +1107,16 @@ impl<'a> Tr<'a> {
 /// surface (128) may lie from their centre and still be read as one point ([`snap_poles`]).
 const POLE_SNAP: f64 = 10.0;
 
-/// A side of a B-spline surface's control net (`ni` × `nj`, the first index fastest) whose
-/// points all lie within `reach` of their centre, made that one point: a pole. Exporters write a
-/// side meant to collapse (a deck patch running out to the stem) a few micrometres wide, which
-/// is neither a pole nor an edge to the reader: the side's few micrometres span its whole
-/// parameter range, so where its ends map in (u, v) is a guess, and a mirrored copy of a patch
-/// that read well (the same side, u and v swapped) was refused as a loop across a seam. Moving
-/// points by no more than `reach` leaves the surface where it was to within that.
-fn snap_poles(pts: &mut [V3], ni: usize, nj: usize, reach: f64) {
+/// A side of a B-spline surface's control net (`ni` × `nj`, the first index fastest) that
+/// starts and ends at one point (within `tol`) and whose points all lie within `reach` of it,
+/// made that one point: a pole. Exporters write a side meant to collapse (a deck patch running
+/// out to the stem) a few micrometres wide, which is neither a pole nor an edge to the reader:
+/// the side's few micrometres span its whole parameter range, so where its ends map in (u, v)
+/// is a guess, and a mirrored copy of a patch that read well (the same side, u and v swapped)
+/// was refused as a loop across a seam. A short side whose ends are apart is an edge, however
+/// short, and stays: a hull of small bilinear patches has sides a fraction of a millimetre long
+/// that its neighbours share, and collapsing them tore the hull apart.
+fn snap_poles(pts: &mut [V3], ni: usize, nj: usize, tol: f64, reach: f64) {
     if ni < 2 || nj < 2 || pts.len() != ni * nj {
         return;
     }
@@ -1128,7 +1130,8 @@ fn snap_poles(pts: &mut [V3], ni: usize, nj: usize, reach: f64) {
         // The side's first point is the corner its neighbours start from: the pole goes there.
         let Some(corner) = side.first().and_then(|&k| pts.get(k).copied()) else { continue };
         let points: Vec<V3> = side.iter().filter_map(|&k| pts.get(k).copied()).collect();
-        if points.iter().all(|p| *p == corner) || !points.iter().all(|p| norm(sub(*p, corner)) <= reach) {
+        let closed = points.last().is_some_and(|p| norm(sub(*p, corner)) <= tol);
+        if !closed || points.iter().all(|p| *p == corner) || !points.iter().all(|p| norm(sub(*p, corner)) <= reach) {
             continue;
         }
         for &k in &side {

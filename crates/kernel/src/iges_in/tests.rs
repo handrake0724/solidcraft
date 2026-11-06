@@ -654,3 +654,19 @@ fn a_side_written_almost_as_a_pole_is_read_as_one_either_way_round() {
         assert_eq!(faces, 1, "{:?}", imp.warnings);
     }
 }
+
+/// A short side whose ends are apart is an edge, not a pole to be snapped: two bilinear patches
+/// share a side a few times the tolerance long (a hull of small patches has many), each running
+/// it from a different end. Collapsing it in each to its own first corner left the two sides
+/// apart, and the patches no longer sewed into one body.
+#[test]
+fn a_short_side_two_patches_share_stays_an_edge() {
+    let short = 5e-5;
+    let ents = vec![
+        bilinear_patch([0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [10.0, short, 0.0], [0.0, 10.0, 0.0]),
+        bilinear_patch([10.0, short, 0.0], [20.0, 10.0, 0.0], [20.0, 0.0, 0.0], [10.0, 0.0, 0.0]),
+    ];
+    let imp = iges_import(&iges_file(&ents)).unwrap();
+    assert_eq!(imp.bodies.len(), 1, "{:?}", imp.warnings);
+    assert_eq!(imp.bodies[0].body.face_count(), 2, "{:?}", imp.warnings);
+}
