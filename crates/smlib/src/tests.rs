@@ -417,6 +417,41 @@ fn an_edge_a_few_um_past_its_patch_keeps_its_interval() {
     assert!((u - 1.0).abs() < 1e-9 && v.abs() < 1e-9, "{u} {v}");
 }
 
+/// SMLib makes a long trim as cubic pieces joined end to end, each break a triple knot: a
+/// propeller blade's edge came to 4612 control points, past the record's 4096, and the face was
+/// left out. Such a pcurve is refitted within the record, its ends exact and its course on the
+/// surface unchanged (here 1500 pieces of one cubic, which the refit holds exactly).
+#[test]
+fn a_pcurve_longer_than_the_record_holds_is_refitted_within_it() {
+    use solidcore_record::brep::{Curve2, Surface};
+    let g = [0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0];
+    let z = [0.0, 0.0, 2.0 / 3.0, 2.0];
+    let bezier = vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
+    let points: Vec<Vec<[f64; 3]>> = (0..4).map(|i| (0..4).map(|j| [10.0 * g[i], 10.0 * g[j], z[j]]).collect()).collect();
+    let surface = Surface::Spline { u_knots: bezier.clone(), v_knots: bezier, points };
+    let c = |t: f64| [t, 0.2 + 0.6 * t - 0.4 * t * t + 0.3 * t * t * t];
+    let dc = |t: f64| [1.0, 0.6 - 0.8 * t + 0.9 * t * t];
+    let pieces = 1500;
+    let (mut knots, mut pts) = (vec![0.0; 4], vec![c(0.0)]);
+    for k in 0..pieces {
+        let (t0, t1) = (k as f64 / pieces as f64, (k + 1) as f64 / pieces as f64);
+        let h = (t1 - t0) / 3.0;
+        let (p0, d0, p3, d3) = (c(t0), dc(t0), c(t1), dc(t1));
+        pts.extend([[p0[0] + h * d0[0], p0[1] + h * d0[1]], [p3[0] - h * d3[0], p3[1] - h * d3[1]], p3]);
+        knots.extend(if k + 1 < pieces { [t1; 3].to_vec() } else { vec![1.0; 4] });
+    }
+    let chain = Curve2::Spline { knots, points: pts };
+    let fit = crate::pcurves::within_record_size(chain, &surface, 1e-6).unwrap();
+    let Curve2::Spline { points, .. } = &fit else { panic!("a spline") };
+    assert!(points.len() <= 4096, "{} points", points.len());
+    assert_eq!((points[0], points[points.len() - 1]), (c(0.0), c(1.0)));
+    for k in 0..=1000 {
+        let t = k as f64 / 1000.0;
+        let [u, v] = solidcore_ops::pcurve::eval(&fit, t).unwrap();
+        assert!((u - c(t)[0]).abs() < 1e-9 && (v - c(t)[1]).abs() < 1e-9, "{t}: {u} {v}");
+    }
+}
+
 /// A solidcore call blocked on a channel until `release`, on its own thread: a call that runs long
 /// or never returns, as one design's slow operation does.
 fn call_held_open(body: &str) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<Result<()>>) {

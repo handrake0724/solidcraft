@@ -1603,8 +1603,30 @@ fn pcurves<'a>(
     if given.len() != loops.len() {
         return Err(invalid("UV trims of a face"));
     }
-    let mut uses = Vec::new();
+    // SMLib's trims as the record holds them: one longer than a record's spline is refitted.
+    let mut fitted: Vec<Vec<Option<b::Curve2>>> = Vec::with_capacity(given.len());
     for (l, g) in loops.iter().zip(given) {
+        let Loop::Edges(l) = l else {
+            fitted.push(Vec::new());
+            continue;
+        };
+        if g.len() != l.len() {
+            return Err(invalid("UV trims of a loop"));
+        }
+        let mut f = Vec::with_capacity(g.len());
+        for (&(e, _), pc) in l.iter().zip(g) {
+            f.push(match pc {
+                Some(pc) => {
+                    let tolerance = edge(e).ok_or_else(|| invalid("edge"))?.tolerance.max(tolerance);
+                    Some(crate::pcurves::within_record_size(pc.clone(), surface, tolerance).map_err(|e| invalid(format!("pcurve: {e}")))?)
+                }
+                None => None,
+            });
+        }
+        fitted.push(f);
+    }
+    let mut uses = Vec::new();
+    for (l, g) in loops.iter().zip(&fitted) {
         let Loop::Edges(l) = l else { continue };
         if g.len() != l.len() {
             return Err(invalid("UV trims of a loop"));

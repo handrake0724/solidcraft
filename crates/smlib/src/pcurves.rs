@@ -2,7 +2,8 @@
 //! curve on a cone, a file's spline edge on a spline surface): the face goes to SMLib alone, an
 //! open sheet, with the trims it has and without the others, and SMLib makes those as it makes
 //! every trim it needs (`SmEdgeuse::GetOrCreateUVTrimCurve`, when the body is exported). They are
-//! SMLib's, relayed as it holds them on the record's parameters; nothing here fits a curve.
+//! SMLib's, relayed as it holds them on the record's parameters. The one curve fitted here is a
+//! pcurve longer than the record holds ([`within_record_size`]).
 
 use solidcraft_geom::prelude::*;
 use std::collections::HashSet;
@@ -136,6 +137,204 @@ pub(crate) fn on_our_interval(pc: Curve2, ours: &solidcore_ops::pcurve::TrimEdge
         Curve2::Spline { knots, points } => Curve2::Spline { knots: knots.into_iter().map(map).collect(), points },
         Curve2::RationalSpline { knots, homogeneous } => Curve2::RationalSpline { knots: knots.into_iter().map(map).collect(), homogeneous },
     })
+}
+
+/// The most control points a record's spline holds (`solidcore_record`'s check).
+const RECORD_MAX_POINTS: usize = 4096;
+/// Samples per span of a refitted pcurve, for the least-squares fit (the measure takes twice as
+/// many).
+const REFIT_SAMPLES: usize = 6;
+
+/// `pc` as the record holds it. SMLib makes a long trim on a free-form surface as a chain of
+/// cubic pieces joined end to end (each interior knot three times), and a propeller blade's edge
+/// came to 1538 of them, 4612 control points, past the record's 4096: the face was left out.
+/// Such a pcurve is refitted by least squares as a cubic B-spline on the same parameters and
+/// the same breaks, each a double knot instead of a triple one (a single knot where that is
+/// still too many points, else breaks spread evenly). Its ends stay exact, since they meet the
+/// loop's next and previous uses, and it is kept only where it lies within `tolerance` of the
+/// original on the face's surface.
+pub(crate) fn within_record_size(pc: Curve2, surface: &b::Surface, tolerance: f64) -> Result<Curve2, String> {
+    let Curve2::Spline { points, knots: given } = &pc else { return Ok(pc) };
+    if points.len() <= RECORD_MAX_POINTS {
+        return Ok(pc);
+    }
+    let [a, b] = pc.interval().ok_or("pcurve without an interval")?;
+    let at = |t: f64| solidcore_ops::pcurve::eval(&pc, t).ok_or_else(|| format!("pcurve has no point at {t}"));
+    let p = 3usize;
+    let mut breaks: Vec<f64> = given.iter().copied().filter(|k| *k > a && *k < b).collect();
+    breaks.dedup();
+    let interior: Vec<f64> = if 2 * breaks.len() + p < RECORD_MAX_POINTS {
+        breaks.iter().flat_map(|k| [*k, *k]).collect()
+    } else if breaks.len() + p < RECORD_MAX_POINTS {
+        breaks
+    } else {
+        let spans = RECORD_MAX_POINTS - p - 1;
+        (1..spans).map(|i| a + (b - a) * (i as f64 / spans as f64)).collect()
+    };
+    let mut knots = vec![a; p + 1];
+    knots.extend(interior);
+    knots.extend(std::iter::repeat_n(b, p + 1));
+    let n = knots.len() - p - 1;
+    let (first, last) = (at(a)?, at(b)?);
+    // The parameters sampled: evenly within each span.
+    let mut cuts: Vec<f64> = knots.clone();
+    cuts.dedup();
+    let sample = |per: usize| -> Vec<f64> {
+        let mut ts: Vec<f64> = cuts.windows(2).flat_map(|w| (0..per).map(move |i| w[0] + (w[1] - w[0]) * (i as f64 / per as f64))).collect();
+        ts.push(b);
+        ts
+    };
+    // Normal equations for the interior points 1..n-1, banded (half-width p).
+    let m = n - 2;
+    let mut band = vec![[0.0f64; 4]; m];
+    let mut rhs = vec![[0.0f64; 2]; m];
+    for t in sample(REFIT_SAMPLES) {
+        let q = at(t)?;
+        let (span, basis) = bspline_basis(&knots, n, p, t).ok_or("refit basis")?;
+        // Fixed ends move to the right-hand side.
+        let mut r = q;
+        for (k, nk) in basis.iter().enumerate() {
+            let i = span + k - p;
+            let fixed = if i == 0 {
+                Some(first)
+            } else if i == n - 1 {
+                Some(last)
+            } else {
+                None
+            };
+            if let Some(f) = fixed {
+                r = [r[0] - nk * f[0], r[1] - nk * f[1]];
+            }
+        }
+        for (k, nk) in basis.iter().enumerate() {
+            let i = span + k - p;
+            if i == 0 || i == n - 1 {
+                continue;
+            }
+            let row = i - 1;
+            if let Some(slot) = rhs.get_mut(row) {
+                *slot = [slot[0] + nk * r[0], slot[1] + nk * r[1]];
+            }
+            for (l, nl) in basis.iter().enumerate().take(k + 1) {
+                let j = span + l - p;
+                if j == 0 || j == n - 1 {
+                    continue;
+                }
+                // band[row][d]: the entry (row, row - d).
+                if let Some(cell) = band.get_mut(row).and_then(|c| c.get_mut(i - j)) {
+                    *cell += nk * nl;
+                }
+            }
+        }
+    }
+    let interior = banded_solve(&mut band, rhs).ok_or("refit system")?;
+    let mut out = Vec::with_capacity(n);
+    out.push(first);
+    out.extend(interior);
+    out.push(last);
+    let fit = Curve2::Spline { knots, points: out };
+    // Measured on the surface, between the samples as well as at them.
+    let surface = solidcraft_geom::brep::eval::SurfaceEval::new(surface).map_err(|e| e.to_string())?;
+    let mut worst = 0.0f64;
+    for t in sample(2 * REFIT_SAMPLES) {
+        let (Some(p0), Some(p1)) = (surface.point(at(t)?), solidcore_ops::pcurve::eval(&fit, t).and_then(|uv| surface.point(uv))) else {
+            return Err("refitted pcurve off its surface".into());
+        };
+        worst = worst.max(p0.dist(p1));
+    }
+    if !(worst <= tolerance) {
+        return Err(format!("a pcurve of {} points refitted to {n} strays {worst} mm (tolerance {tolerance} mm)", points.len()));
+    }
+    Ok(fit)
+}
+
+/// The knot span holding `t` and the `p + 1` basis functions nonzero there, of a clamped spline
+/// of `n` points.
+fn bspline_basis(knots: &[f64], n: usize, p: usize, t: f64) -> Option<(usize, Vec<f64>)> {
+    let span = if t >= *knots.get(n)? {
+        n - 1
+    } else {
+        // The last span s in p..n with knots[s] <= t.
+        let (mut lo, mut hi) = (p, n);
+        while hi - lo > 1 {
+            let mid = (lo + hi) / 2;
+            if t < *knots.get(mid)? {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        lo
+    };
+    let mut nb = vec![0.0; p + 1];
+    let (mut left, mut right) = (vec![0.0; p + 1], vec![0.0; p + 1]);
+    *nb.first_mut()? = 1.0;
+    for j in 1..=p {
+        *left.get_mut(j)? = t - knots.get(span + 1 - j)?;
+        *right.get_mut(j)? = knots.get(span + j)? - t;
+        let mut saved = 0.0;
+        for r in 0..j {
+            let denom = right.get(r + 1)? + left.get(j - r)?;
+            let temp = if denom != 0.0 { nb.get(r)? / denom } else { 0.0 };
+            *nb.get_mut(r)? = saved + right.get(r + 1)? * temp;
+            saved = left.get(j - r)? * temp;
+        }
+        *nb.get_mut(j)? = saved;
+    }
+    Some((span, nb))
+}
+
+/// Solve a symmetric positive definite banded system (`band[i][d]` the entry (i, i - d), half
+/// width 3) for two right-hand sides, by Cholesky in place.
+fn banded_solve(band: &mut [[f64; 4]], mut rhs: Vec<[f64; 2]>) -> Option<Vec<[f64; 2]>> {
+    let m = band.len();
+    for i in 0..m {
+        for d in (0..4).rev() {
+            if d > i {
+                continue;
+            }
+            let j = i - d;
+            // sum over k < j within the band of L(i,k) L(j,k)
+            let mut sum = band.get(i)?.get(d).copied()?;
+            for k in j.saturating_sub(3)..j {
+                if i - k > 3 {
+                    continue;
+                }
+                sum -= band.get(i)?.get(i - k)? * band.get(j)?.get(j - k)?;
+            }
+            if d == 0 {
+                if !(sum > 0.0) {
+                    return None;
+                }
+                *band.get_mut(i)?.get_mut(0)? = sum.sqrt();
+            } else {
+                *band.get_mut(i)?.get_mut(d)? = sum / band.get(j)?.first()?;
+            }
+        }
+    }
+    // L y = r, then Lᵀ x = y.
+    for i in 0..m {
+        let mut y = *rhs.get(i)?;
+        for d in 1..4.min(i + 1) {
+            let (l, prev) = (band.get(i)?.get(d)?, rhs.get(i - d)?);
+            y = [y[0] - l * prev[0], y[1] - l * prev[1]];
+        }
+        let diag = band.get(i)?.first()?;
+        *rhs.get_mut(i)? = [y[0] / diag, y[1] / diag];
+    }
+    for i in (0..m).rev() {
+        let mut x = *rhs.get(i)?;
+        for d in 1..4 {
+            if i + d >= m {
+                break;
+            }
+            let (l, next) = (band.get(i + d)?.get(d)?, rhs.get(i + d)?);
+            x = [x[0] - l * next[0], x[1] - l * next[1]];
+        }
+        let diag = band.get(i)?.first()?;
+        *rhs.get_mut(i)? = [x[0] / diag, x[1] / diag];
+    }
+    Some(rhs)
 }
 
 /// The face as a one-face open sheet, and its uses that go without trims.
