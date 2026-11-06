@@ -630,3 +630,27 @@ fn a_number_equal_to_a_surface_entry_does_not_hide_the_surface() {
     let read: usize = imp.bodies.iter().map(|b| b.body.face_count()).sum();
     assert_eq!(read, faces.len(), "{:?}", imp.warnings);
 }
+
+/// A fan patch whose side at the apex is written a few hundredths of a micrometre wide instead
+/// of as one point, with that side at u = 0 or, its u and v swapped (as a mirrored copy came
+/// from Rhino), at v = 0. The side spans its whole parameter range while it is far shorter than
+/// the tolerance, so where its ends fall in (u, v) was a guess: one of the two was refused as
+/// a loop across a closed surface's seam and the face was lost. Snapped to the pole it means,
+/// both come in, each one face.
+#[test]
+fn a_side_written_almost_as_a_pole_is_read_as_one_either_way_round() {
+    let fmt = |p: [f64; 3]| format!("{:?},{:?},{:?}", p[0], p[1], p[2]);
+    let (apex, off) = ([0.0, 0.0, 0.0], [0.0, 4e-5, 0.0]);
+    let far = [[10.0, 0.0, 0.0], [10.0, 5.0, 0.0], [10.0, 10.0, 0.0]];
+    // The apex side at u = 0: u linear (2 points), v quadratic (3).
+    let along_v = [apex, far[0], off, far[1], apex, far[2]].map(fmt).join(",");
+    let at_u0 = (128, 0, format!("1,2,1,2,0,0,1,0,0,0.,0.,1.,1.,0.,0.,0.,1.,1.,1.,1.,1.,1.,1.,1.,1.,{along_v},0.,1.,0.,1."));
+    // The same patch with u and v swapped: the apex side at v = 0.
+    let along_u = [apex, off, apex, far[0], far[1], far[2]].map(fmt).join(",");
+    let at_v0 = (128, 0, format!("2,1,2,1,0,0,1,0,0,0.,0.,0.,1.,1.,1.,0.,0.,1.,1.,1.,1.,1.,1.,1.,1.,{along_u},0.,1.,0.,1."));
+    for patch in [at_u0, at_v0] {
+        let imp = iges_import(&iges_file(&[patch])).unwrap();
+        let faces: usize = imp.bodies.iter().map(|b| b.body.face_count()).sum();
+        assert_eq!(faces, 1, "{:?}", imp.warnings);
+    }
+}
