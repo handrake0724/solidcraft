@@ -607,3 +607,26 @@ fn the_global_sections_native_system_becomes_the_originating_system() {
     let imp = round_trip(&box_solid(Vec3::ZERO, Vec3::new(10.0, 20.0, 30.0)).unwrap());
     assert_eq!(imp.system, "SolidCraft");
 }
+
+/// Untrimmed B-spline surfaces (128) are parts of their own unless another entity builds on
+/// them. Every parameter of every entity used to count as a pointer: a count or a degree equal
+/// to a surface's directory number dropped that surface unread and unreported (a Rhino hull lost
+/// a dozen of its plates, among them a deck whose number, 11, was another plate's control point
+/// count less one). Here the second patch's degree and counts, 1, name the first patch's
+/// directory entry; both patches come in, and a trimmed surface's base is still not read twice.
+#[test]
+fn a_number_equal_to_a_surface_entry_does_not_hide_the_surface() {
+    let ents = vec![
+        bilinear_patch([0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [10.0, 10.0, 0.0], [0.0, 10.0, 0.0]),
+        bilinear_patch([20.0, 0.0, 0.0], [30.0, 0.0, 0.0], [30.0, 10.0, 0.0], [20.0, 10.0, 0.0]),
+    ];
+    let imp = iges_import(&iges_file(&ents)).unwrap();
+    let faces: usize = imp.bodies.iter().map(|b| b.body.face_count()).sum();
+    assert_eq!(faces, 2, "{:?}", imp.warnings);
+
+    let mut ents = Vec::new();
+    let faces = trimmed_box(&mut ents, 0.0);
+    let imp = iges_import(&iges_file(&ents)).unwrap();
+    let read: usize = imp.bodies.iter().map(|b| b.body.face_count()).sum();
+    assert_eq!(read, faces.len(), "{:?}", imp.warnings);
+}
