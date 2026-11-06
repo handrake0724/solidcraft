@@ -602,6 +602,86 @@ fn a_curve_over_a_tiny_knot_span_still_bounds_its_faces() {
     }
 }
 
+/// A 10 × 10 plate bounded (143) by a boundary (141) of four lines with their parameter-space
+/// lines, the edge from (10, 0) to (10, 10) written by `side` (its model-space curve's
+/// parameters, a 126 B-spline when given), and `corner` (a model-space 126 and its
+/// parameter-space 110) inserted at (10, 10) when given.
+fn bounded_plate(side: Option<&str>, corner: Option<(&str, &str)>, pref: i64) -> String {
+    let fmt = |p: [f64; 3]| format!("{:?},{:?},{:?}", p[0], p[1], p[2]);
+    let mut ents: Vec<(i64, i64, String)> = vec![bilinear_patch([0.0; 3], [10.0, 0.0, 0.0], [10.0, 10.0, 0.0], [0.0, 10.0, 0.0])];
+    let corners = [[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [10.0, 10.0, 0.0], [0.0, 10.0, 0.0]];
+    let uv = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]];
+    let mut pairs = Vec::new();
+    for k in 0..4 {
+        match (k, side) {
+            (1, Some(p)) => ents.push((126, 0, p.to_string())),
+            _ => ents.push((110, 0, format!("{},{}", fmt(corners[k]), fmt(corners[(k + 1) % 4])))),
+        }
+        let c = 2 * ents.len() - 1;
+        ents.push((110, 0, format!("{},{}", fmt(uv[k]), fmt(uv[(k + 1) % 4]))));
+        pairs.push((c, 2 * ents.len() - 1));
+        if let (1, Some((model, param))) = (k, corner) {
+            ents.push((126, 0, model.to_string()));
+            let c = 2 * ents.len() - 1;
+            ents.push((110, 0, param.to_string()));
+            pairs.push((c, 2 * ents.len() - 1));
+        }
+    }
+    let list = pairs.iter().map(|(c, p)| format!("{c},1,1,{p}")).collect::<Vec<_>>().join(",");
+    ents.push((141, 0, format!("1,{pref},1,{},{list}", pairs.len())));
+    ents.push((143, 0, format!("1,1,1,{}", 2 * ents.len() - 1)));
+    iges_file(&ents)
+}
+
+/// A boundary curve that wanders off its surface (as a Rhino export of a ship's deck wrote: a
+/// loop at the bow, 2.8 m across the centre line, whose parameter-space curve is one point of the
+/// surface) made the kernel refuse the edge and lose the whole face. The parameter-space curve
+/// is taken instead: the loop is a single point there, so it is left out and the plate is whole.
+/// A side written bowed 3 mm, or 0.6 mm (as a propeller blade's edges were, past what the kernel
+/// takes into an edge's tolerance), off the plate is replaced by its parameter-space line; one
+/// bowed 0.1 mm is kept, its gap the edge's tolerance; a side that bulges 1 mm only between the
+/// points a piece keeps is measured along its course and replaced. Boundaries on the surface, or
+/// that say to trust their model-space curves (PREF 1), are kept as written.
+#[test]
+fn boundary_curves_off_their_surface_give_way_to_their_parameter_space_curves() {
+    let area = |text: &str| -> (f64, Vec<String>) {
+        let imp = iges_import(text).unwrap();
+        assert_eq!(imp.bodies.len(), 1, "{:?}", imp.warnings);
+        (measure(&imp.bodies[0].body).unwrap().area, imp.warnings)
+    };
+    let (a, w) = area(&bounded_plate(None, None, 3));
+    assert!(rel(a, 100.0) < 1e-6 && !w.iter().any(|w| w.contains("strays")), "{a} {w:?}");
+    // A closed loop out to (11, 13, -1) and back, over a zero-length parameter-space line.
+    let loop_out = "3,1,0,0,0,0,0.,0.,1.,2.,3.,3.,1.,1.,1.,1.,10.,10.,0.,11.,13.,-1.,13.,11.,-1.,10.,10.,0.,0.,3.,0.,0.,1.";
+    let (a, w) = area(&bounded_plate(None, Some((loop_out, "1.,1.,0.,1.,1.,0.")), 3));
+    assert!(rel(a, 100.0) < 1e-6, "{a} {w:?}");
+    assert!(w.iter().any(|w| w.contains("left out")), "{w:?}");
+    // The side from (10, 0) to (10, 10) bowed 3 mm below the plate.
+    let bowed = "2,2,0,0,1,0,0.,0.,0.,1.,1.,1.,1.,1.,1.,10.,0.,0.,10.,5.,-6.,10.,10.,0.,0.,1.,0.,0.,1.";
+    let (a, w) = area(&bounded_plate(Some(bowed), None, 3));
+    assert!(rel(a, 100.0) < 1e-6, "{a} {w:?}");
+    assert!(w.iter().any(|w| w.contains("used instead")), "{w:?}");
+    if let Ok(imp) = iges_import(&bounded_plate(Some(bowed), None, 1)) {
+        assert!(!imp.warnings.iter().any(|w| w.contains("used instead")), "{:?}", imp.warnings);
+    }
+    // Bowed 0.6 mm (its middle control point 1.2 mm off): replaced. Bowed 0.1 mm: kept.
+    let bowed = "2,2,0,0,1,0,0.,0.,0.,1.,1.,1.,1.,1.,1.,10.,0.,0.,10.,5.,-1.2,10.,10.,0.,0.,1.,0.,0.,1.";
+    let (a, w) = area(&bounded_plate(Some(bowed), None, 3));
+    assert!(rel(a, 100.0) < 1e-6, "{a} {w:?}");
+    assert!(w.iter().any(|w| w.contains("used instead")), "{w:?}");
+    let bowed = "2,2,0,0,1,0,0.,0.,0.,1.,1.,1.,1.,1.,1.,10.,0.,0.,10.,5.,-0.2,10.,10.,0.,0.,1.,0.,0.,1.";
+    let imp = iges_import(&bounded_plate(Some(bowed), None, 3)).unwrap();
+    assert!(!imp.warnings.iter().any(|w| w.contains("used instead")), "{:?}", imp.warnings);
+    // A quintic side on the plate at 0, 1/4, 1/2, 3/4 and 1 of the way along that bulges 1 mm
+    // between: measured along its course, not only at those points, it is replaced too.
+    let z = [0.0, 5.287175557, -11.455547039, 11.455547039, -5.287175557, 0.0];
+    let points: Vec<String> = (0..6).map(|j| format!("10.,{:?},{:?}", 2.0 * j as f64, z[j])).collect();
+    let wavy = format!("5,5,0,0,1,0,0.,0.,0.,0.,0.,0.,1.,1.,1.,1.,1.,1.,1.,1.,1.,1.,1.,1.,{},0.,1.,0.,0.,1.", points.join(","));
+    let (a, w) = area(&bounded_plate(Some(&wavy), None, 3));
+    assert!(rel(a, 100.0) < 1e-6, "{a} {w:?}");
+    assert!(w.iter().any(|w| w.contains("used instead")), "{w:?}");
+}
+
 #[test]
 fn the_global_sections_native_system_becomes_the_originating_system() {
     let imp = round_trip(&box_solid(Vec3::ZERO, Vec3::new(10.0, 20.0, 30.0)).unwrap());

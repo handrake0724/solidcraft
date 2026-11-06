@@ -439,6 +439,45 @@ impl Arc {
     }
 }
 
+/// A B-spline surface (128), placed, read once to be evaluated many times: the rows of its
+/// control net as curves in u, combined at v (homogeneous, as the rational tensor product does).
+struct SurfEval {
+    deg_v: usize,
+    v_knots: Vec<f64>,
+    rows: Vec<Nurbs>,
+}
+
+impl SurfEval {
+    fn eval(&self, u: f64, v: f64) -> Option<V3> {
+        let column = self.rows.iter().map(|r| r.eval_h(u)).collect::<Option<Vec<_>>>()?;
+        Nurbs { deg: self.deg_v, knots: self.v_knots.clone(), pts: column }.eval(v)
+    }
+}
+
+/// A piece of a curve in a surface's parameter space: (u, v) are its first two coordinates.
+enum ParamPiece {
+    Line(V3, V3),
+    Arc(Arc),
+    Spline(Nurbs),
+}
+
+impl ParamPiece {
+    /// The point `s` (0 to 1) of the way along.
+    fn at(&self, s: f64) -> Option<V3> {
+        match self {
+            ParamPiece::Line(a, b) => Some(add(*a, mul(sub(*b, *a), s))),
+            ParamPiece::Arc(Arc { c, rad, a0, a1 }) => {
+                let t = a0 + (a1 - a0) * s;
+                Some([c[0] + rad * t.cos(), c[1] + rad * t.sin(), c[2]])
+            }
+            ParamPiece::Spline(nb) => {
+                let (t0, t1) = nb.range();
+                nb.eval(t0 + (t1 - t0) * s)
+            }
+        }
+    }
+}
+
 struct Tr<'a> {
     f: &'a Iges,
     o: Out,
@@ -965,6 +1004,11 @@ impl<'a> Tr<'a> {
 
     /// The point of a B-spline surface (128) at parameters (u, v), placed as `surface` places it.
     fn surface_point(&self, seq: i64, xf: &Xf, u: f64, v: f64) -> R<V3> {
+        self.surface_eval(seq, xf)?.eval(u, v).ok_or_else(|| "surface cannot be evaluated".into())
+    }
+
+    /// A B-spline surface (128) read for evaluation, placed as `surface` places it.
+    fn surface_eval(&self, seq: i64, xf: &Xf) -> R<SurfEval> {
         if self.de(seq)?.typ != 128 {
             return Err(format!("entity {seq}: only B-spline surfaces are evaluated"));
         }
@@ -974,14 +1018,15 @@ impl<'a> Tr<'a> {
             return Err(format!("entity {seq}: bad B-spline surface size"));
         }
         let (k1, k2, m1, m2) = (k1 as usize, k2 as usize, m1 as usize, m2 as usize);
+        if (k1 + 1) * (k2 + 1) > MAX_LIST {
+            return Err(format!("entity {seq}: bad B-spline surface size"));
+        }
         let (n1, n2) = (k1 + m1 + 2, k2 + m2 + 2);
         let s_knots: Vec<f64> = (0..n1).map(|j| self.n(seq, 10 + j)).collect::<R<_>>()?;
         let t_knots: Vec<f64> = (0..n2).map(|j| self.n(seq, 10 + n1 + j)).collect::<R<_>>()?;
         let base_w = 10 + n1 + n2;
         let base_p = base_w + (k1 + 1) * (k2 + 1);
-        // Each row of the net at u, then the column of those points at v (homogeneous, so the
-        // weights combine as the rational tensor product does).
-        let mut column = Vec::with_capacity(k2 + 1);
+        let mut rows = Vec::with_capacity(k2 + 1);
         for j in 0..=k2 {
             let mut row = Vec::with_capacity(k1 + 1);
             for i in 0..=k1 {
@@ -990,10 +1035,48 @@ impl<'a> Tr<'a> {
                 let p = x.point(self.pt(seq, base_p + 3 * idx)?);
                 row.push([p[0] * w, p[1] * w, p[2] * w, w]);
             }
-            let h = Nurbs { deg: m1, knots: s_knots.clone(), pts: row }.eval_h(u).ok_or("surface cannot be evaluated")?;
-            column.push(h);
+            rows.push(Nurbs { deg: m1, knots: s_knots.clone(), pts: row });
         }
-        Nurbs { deg: m2, knots: t_knots, pts: column }.eval(v).ok_or_else(|| "surface cannot be evaluated".into())
+        Ok(SurfEval { deg_v: m2, v_knots: t_knots, rows })
+    }
+
+    /// The pieces of a curve in a surface's parameter space (lines, arcs, B-splines and
+    /// composites of them, as for [`Tr::param_start`]), each with its placement. `budget`
+    /// counts the entities visited, so a composite that names its children many times over
+    /// stops (see `MAX_CURVE_WORK`).
+    fn param_pieces(&self, seq: i64, xf: &Xf, depth: usize, budget: &mut usize, out: &mut Vec<(ParamPiece, Xf)>) -> R<()> {
+        if depth > MAX_DEPTH {
+            return Err("parameter-space curves nested too deeply".into());
+        }
+        *budget = budget.checked_sub(1).ok_or("parameter-space curves too complex")?;
+        let x = xf.then(&self.own_xf_in(seq, 0, 1.0)?);
+        match self.de(seq)?.typ {
+            110 => out.push((ParamPiece::Line(self.pt_in(seq, 1, 1.0)?, self.pt_in(seq, 4, 1.0)?), x)),
+            100 => {
+                let zt = self.n(seq, 1)?;
+                let c = [self.n(seq, 2)?, self.n(seq, 3)?, zt];
+                let (s, e) = ([self.n(seq, 4)?, self.n(seq, 5)?], [self.n(seq, 6)?, self.n(seq, 7)?]);
+                let rad = (s[0] - c[0]).hypot(s[1] - c[1]);
+                if !(rad > 0.0) {
+                    return Err(format!("entity {seq}: arc of zero radius"));
+                }
+                let a0 = (s[1] - c[1]).atan2(s[0] - c[0]);
+                let mut a1 = (e[1] - c[1]).atan2(e[0] - c[0]);
+                if a1 <= a0 + 1e-12 {
+                    a1 += std::f64::consts::TAU;
+                }
+                out.push((ParamPiece::Arc(Arc { c, rad, a0, a1 }), x));
+            }
+            126 => out.push((ParamPiece::Spline(self.nurbs_curve_in(seq, &Xf::ID, 1.0)?), x)),
+            102 => {
+                let n = self.i(seq, 1)?.clamp(0, MAX_LIST as i64) as usize;
+                for k in 0..n {
+                    self.param_pieces(self.i(seq, 2 + k)?, &x, depth + 1, budget, out)?;
+                }
+            }
+            t => return Err(format!("parameter-space curve type {t} is not read")),
+        }
+        Ok(())
     }
 
     /// Segment `s` made to run from `pa` to `pb`, the vertices its piece meets the pieces before
@@ -1756,28 +1839,204 @@ fn head_to_tail(segs: Vec<Seg>, start: Option<V3>, tol: f64) -> Vec<Seg> {
         .collect()
 }
 
-/// The model-space curves of a boundary (141), each in its sense.
+/// The model-space curves of a boundary (141), each in its sense. A curve that strays from the
+/// surface the boundary lies on gives way to its curve in that surface's parameter space
+/// ([`trim_on_surface`]), unless the boundary says its model-space curves are the ones to
+/// trust (PREF 1).
 fn boundary_141(t: &mut Tr, seq: i64, xf: &Xf) -> R<Vec<Seg>> {
     let de = t.de(seq)?;
     if de.typ != 141 {
         return t.curve(seq, xf, 0);
     }
     let x = xf.then(&t.own_xf(seq, 0)?);
+    let pref = t.i(seq, 2).unwrap_or(0);
     let n = t.i(seq, 4)?.clamp(0, MAX_LIST as i64) as usize;
+    let mut surface: Option<Option<SurfEval>> = None;
     let mut out = Vec::new();
     let mut idx = 5;
     for _ in 0..n {
         let c = t.i(seq, idx)?;
         let sense = t.i(seq, idx + 1)?;
         let k = t.i(seq, idx + 2)?.clamp(0, 1024) as usize;
+        let params: Vec<i64> = (0..k).filter_map(|j| t.i(seq, idx + 3 + j).ok()).collect();
         idx += 3 + k;
         let mut segs = t.curve(c, &x, 0)?;
+        if pref != 1 && !params.is_empty() {
+            let s = surface.get_or_insert_with(|| t.i(seq, 3).ok().and_then(|s| t.surface_eval(s, xf).ok()));
+            if let Some(s) = s {
+                segs = trim_on_surface(t, s, segs, &params, c);
+            }
+        }
         if sense == 2 {
             segs = segs.into_iter().rev().map(Seg::reversed).collect();
         }
         out.extend(segs);
     }
     Ok(out)
+}
+
+/// Points sampled along each piece of a parameter-space trim curve to compare it with its
+/// model-space curve.
+const PARAM_SAMPLES: usize = 64;
+/// How far (mm) a trim curve may stray from its surface before its parameter-space curve is
+/// taken instead ([`trim_on_surface`]): below the gap the kernel still takes into an edge's
+/// tolerance (its 1 mm tolerance cap over the three times the gap an edge needs, a third of a
+/// millimetre), so only a curve whose face would otherwise be lost is replaced.
+const TRIM_STRAY_LIMIT: f64 = 0.2;
+/// Points sampled along each spline piece of a model-space trim curve to measure how far it
+/// strays from its surface ([`trim_on_surface`]).
+const STRAY_SAMPLES: usize = 32;
+/// The most spans a piece of a parameter-space curve is fitted with ([`fit_on_surface`]).
+const MAX_FIT_SPANS: usize = 1024;
+
+/// A trim curve `model` (its pieces in the curve's own direction) checked against the same
+/// curve in the parameter space of `surface` (`params`, the boundary's PSCPT pointers).
+///
+/// The two should be one curve. Some exporters write a model-space curve that wanders off the
+/// surface: a loop metres long at a ship's bow, or a propeller blade's edges half a millimetre
+/// to 1.4 mm off. The kernel takes an edge's gap into its tolerance only so far
+/// ([`TRIM_STRAY_LIMIT`]); past that it refuses the edge and the whole face is lost, while
+/// systems that trim by the parameter-space curve show the face. When the model-space curve
+/// strays further than [`TRIM_STRAY_LIMIT`] from the parameter-space curve on the surface,
+/// but starts and ends where it does (within `max(1 mm, 100 × tolerance)`), the
+/// parameter-space curve is taken: left out where it is a single point, else fitted
+/// ([`fit_on_surface`]). A boundary that says its model-space curves are the ones to trust
+/// (PREF 1) is not checked, and anything that cannot be evaluated keeps the model-space curve.
+fn trim_on_surface(t: &mut Tr, surface: &SurfEval, model: Vec<Seg>, params: &[i64], curve: i64) -> Vec<Seg> {
+    let (Some(first), Some(last)) = (model.first(), model.last()) else { return model };
+    let (start, end) = (first.a, last.b);
+    let mut pieces = Vec::new();
+    let mut budget = 4096;
+    for &p in params {
+        if t.param_pieces(p, &Xf::ID, 0, &mut budget, &mut pieces).is_err() {
+            return model;
+        }
+    }
+    let on = |i: usize, s: f64| -> Option<V3> {
+        let (piece, x) = pieces.get(i)?;
+        let p = x.point(piece.at(s)?);
+        surface.eval(p[0], p[1])
+    };
+    let mut samples = Vec::with_capacity(pieces.len() * (PARAM_SAMPLES + 1));
+    for i in 0..pieces.len() {
+        for k in 0..=PARAM_SAMPLES {
+            let s = k as f64 / PARAM_SAMPLES as f64;
+            let Some(p) = on(i, s) else { return model };
+            samples.push((i, s, p));
+        }
+    }
+    let (Some(&(_, _, p0)), Some(&(_, _, p1))) = (samples.first(), samples.last()) else { return model };
+    let limit = (100.0 * t.tol).max(1.0);
+    if norm(sub(start, p0)) > limit || norm(sub(end, p1)) > limit {
+        return model;
+    }
+    // A spline piece is measured along its whole course: its five kept points can all lie on the
+    // surface while it bulges off between them (a propeller blade's edges did, by 1.4 mm).
+    let mut along = Vec::new();
+    for s in &model {
+        match s.shape {
+            Shape::Spline(i) => {
+                let Some(nb) = t.splines.get(i) else { return model };
+                let (t0, t1) = nb.range();
+                for k in 0..=STRAY_SAMPLES {
+                    let Some(p) = nb.eval(t0 + (t1 - t0) * (k as f64 / STRAY_SAMPLES as f64)) else { return model };
+                    along.push(p);
+                }
+            }
+            _ => along.extend([s.a, s.q, s.mid, s.q3, s.b]),
+        }
+    }
+    let stray = along.iter().map(|p| nearest_on(&on, &samples, *p)).fold(0.0, f64::max);
+    if !(stray > TRIM_STRAY_LIMIT) {
+        return model;
+    }
+    let reach = samples.iter().map(|(_, _, p)| norm(sub(*p, p0))).fold(0.0, f64::max);
+    if reach <= t.tol {
+        t.warn(format!(
+            "trim curve {curve} strays {stray:.3} mm from its surface, where its curve in the surface's parameters is a single point: left out"
+        ));
+        return Vec::new();
+    }
+    let Some((nb, err)) = fit_on_surface(&on, pieces.len(), t.tol) else { return model };
+    t.warn(format!(
+        "trim curve {curve} strays {stray:.3} mm from its surface: its curve in the surface's parameters is used instead (within {err:.2e} mm)"
+    ));
+    let (t0, t1) = nb.range();
+    let c = t.write_nurbs_curve(&nb);
+    let seg = Seg::along(c, |s| nb.eval(t0 + (t1 - t0) * s).unwrap_or([0.0; 3]));
+    t.splines.push(nb);
+    vec![seg.with(Shape::Spline(t.splines.len() - 1))]
+}
+
+/// The distance from `p` to the curve `on` (pieces, each 0 to 1), from the nearest of its
+/// `samples` refined along that piece.
+fn nearest_on(on: &impl Fn(usize, f64) -> Option<V3>, samples: &[(usize, f64, V3)], p: V3) -> f64 {
+    let Some(&(i, s, q)) = samples.iter().min_by(|a, b| norm(sub(a.2, p)).total_cmp(&norm(sub(b.2, p)))) else { return f64::INFINITY };
+    let d = |s: f64| on(i, s).map_or(f64::INFINITY, |x| norm(sub(x, p)));
+    let step = 1.0 / PARAM_SAMPLES as f64;
+    let (mut lo, mut hi) = ((s - step).max(0.0), (s + step).min(1.0));
+    for _ in 0..48 {
+        let (m1, m2) = (lo + (hi - lo) / 3.0, hi - (hi - lo) / 3.0);
+        if d(m1) < d(m2) {
+            hi = m2;
+        } else {
+            lo = m1;
+        }
+    }
+    norm(sub(q, p)).min(d(0.5 * (lo + hi)))
+}
+
+/// A cubic B-spline through points along the curve `on` (`pieces` pieces, each 0 to 1), each
+/// span a Catmull–Rom cubic, with spans halved until the fit is within `tol` of the curve
+/// between its points (at most [`MAX_FIT_SPANS`] a piece). Returns the fit and how far it
+/// strays at the middle of its spans.
+fn fit_on_surface(on: &impl Fn(usize, f64) -> Option<V3>, pieces: usize, tol: f64) -> Option<(Nurbs, f64)> {
+    let mut per = 8;
+    loop {
+        let mut pts: Vec<V3> = Vec::new();
+        let mut mids: Vec<V3> = Vec::new();
+        for i in 0..pieces {
+            for k in 0..=per {
+                if i > 0 && k == 0 {
+                    continue;
+                }
+                pts.push(on(i, k as f64 / per as f64)?);
+                if k < per {
+                    mids.push(on(i, (k as f64 + 0.5) / per as f64)?);
+                }
+            }
+        }
+        let n = pts.len().checked_sub(1)?;
+        let at = |k: isize| -> Option<V3> {
+            if k < 0 {
+                Some(sub(mul(*pts.first()?, 2.0), *pts.get(1)?))
+            } else if k as usize > n {
+                Some(sub(mul(*pts.get(n)?, 2.0), *pts.get(n.checked_sub(1)?)?))
+            } else {
+                pts.get(k as usize).copied()
+            }
+        };
+        let mut ctrl = vec![*pts.first()?];
+        let mut err: f64 = 0.0;
+        for k in 0..n as isize {
+            let (a, b) = (at(k)?, at(k + 1)?);
+            let c1 = add(a, mul(sub(b, at(k - 1)?), 1.0 / 6.0));
+            let c2 = sub(b, mul(sub(at(k + 2)?, a), 1.0 / 6.0));
+            let half = mul(add(add(a, b), mul(add(c1, c2), 3.0)), 1.0 / 8.0);
+            err = err.max(norm(sub(half, *mids.get(k as usize)?)));
+            ctrl.extend([c1, c2, b]);
+        }
+        if err <= tol || per >= MAX_FIT_SPANS {
+            let mut knots = vec![0.0; 4];
+            for k in 1..n {
+                knots.extend([k as f64; 3]);
+            }
+            knots.extend([n as f64; 4]);
+            let pts = ctrl.into_iter().map(|p| [p[0], p[1], p[2], 1.0]).collect();
+            return Some((Nurbs { deg: 3, knots, pts }, err));
+        }
+        per *= 2;
+    }
 }
 
 /// A manifold solid B-rep (186): its solid id and colour.
