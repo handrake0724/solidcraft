@@ -1132,6 +1132,33 @@ impl<'a> Tr<'a> {
         *s
     }
 
+    /// A B-spline surface's (128) control net as placed: the count along u, and each point with
+    /// its weight (x, y, z, w), the first index fastest.
+    fn control_net(&self, seq: i64, xf: &Xf) -> R<(usize, Vec<[f64; 4]>)> {
+        let de = self.de(seq)?;
+        if de.typ != 128 {
+            return Err(format!("entity {seq}: not a B-spline surface"));
+        }
+        let x = xf.then(&self.own_xf(seq, 0)?);
+        let (k1, k2, m1, m2) = (self.i(seq, 1)?, self.i(seq, 2)?, self.i(seq, 3)?, self.i(seq, 4)?);
+        let size = |v: i64| usize::try_from(v).map_err(|_| format!("entity {seq}: bad B-spline surface size"));
+        let (k1, k2, m1, m2) = (size(k1)?, size(k2)?, size(m1)?, size(m2)?);
+        let cnt = k1
+            .checked_add(1)
+            .zip(k2.checked_add(1))
+            .and_then(|(a, b)| a.checked_mul(b))
+            .filter(|c| *c <= MAX_LIST)
+            .ok_or_else(|| format!("entity {seq}: B-spline surface too large"))?;
+        let base_w = 10 + k1 + m1 + 2 + k2 + m2 + 2;
+        let base_p = base_w + cnt;
+        let mut net = Vec::with_capacity(cnt);
+        for idx in 0..cnt {
+            let p = x.point(self.pt(seq, base_p + 3 * idx)?);
+            net.push([p[0], p[1], p[2], self.n(seq, base_w + idx)?]);
+        }
+        Ok((k1 + 1, net))
+    }
+
     /// The natural boundary of a B-spline surface (its four edge curves), for trimmed surfaces
     /// with no outer curve.
     fn natural_boundary(&mut self, seq: i64, xf: &Xf) -> R<Vec<Seg>> {
@@ -1241,6 +1268,8 @@ struct FaceB {
     sense: bool,
     loops: Vec<Vec<(usize, bool)>>,
     color: Option<[f32; 3]>,
+    /// The file's surface entity and its placement ([`Draft::base`]).
+    base: (i64, Xf),
 }
 
 struct Sewer {
@@ -1315,6 +1344,79 @@ impl Sewer {
         self.by_ends.entry(key).or_default().push(e);
         (e, true)
     }
+}
+
+/// Faces that are one face written more than once: the same edges all round, on surfaces whose
+/// control nets agree to within the tolerance. A part made of pieces each closed on its own
+/// (a submarine's upper and lower rudder, each capped where they meet) has such a face between
+/// the pieces, its edges used by every copy and by the faces on both sides, which no solid has.
+/// The copies cancel in pairs, joining the pieces into one, and an odd one out stays. How many
+/// were taken out.
+fn cancel_coincident(t: &Tr, faces: &mut Vec<FaceB>) -> usize {
+    let mut by_edges: HashMap<Vec<usize>, Vec<usize>> = HashMap::new();
+    for (i, f) in faces.iter().enumerate() {
+        let mut edges: Vec<usize> = f.loops.iter().flatten().map(|&(e, _)| e).collect();
+        edges.sort_unstable();
+        by_edges.entry(edges).or_default().push(i);
+    }
+    let mut drop = Vec::new();
+    for group in by_edges.into_values().filter(|g| g.len() > 1) {
+        let nets: Vec<Option<(usize, Vec<[f64; 4]>)>> =
+            group.iter().map(|&i| faces.get(i).and_then(|f| t.control_net(f.base.0, &f.base.1).ok())).collect();
+        let mut taken = vec![false; group.len()];
+        for a in 0..group.len() {
+            if taken[a] {
+                continue;
+            }
+            let Some(Some(na)) = nets.get(a) else { continue };
+            let same: Vec<usize> =
+                (a..group.len()).filter(|&b| !taken[b] && nets.get(b).and_then(|n| n.as_ref()).is_some_and(|nb| same_net(na, nb, t.tol))).collect();
+            for &b in &same {
+                taken[b] = true;
+            }
+            let pairs = same.len() / 2 * 2;
+            drop.extend(same.iter().take(pairs).filter_map(|&b| group.get(b).copied()));
+        }
+    }
+    drop.sort_unstable();
+    for &i in drop.iter().rev() {
+        if i < faces.len() {
+            faces.remove(i);
+        }
+    }
+    drop.len()
+}
+
+/// Two control nets (the count along u, then the points with their weights, u fastest) that are
+/// one surface: their points and weights agree to within `tol` with the grid as it is, or run
+/// the other way along u or v, or with u and v swapped (a face written by each of the two pieces
+/// it divides, each running it its own way).
+fn same_net(a: &(usize, Vec<[f64; 4]>), b: &(usize, Vec<[f64; 4]>), tol: f64) -> bool {
+    let (nu, pa) = (a.0, &a.1);
+    if nu == 0 || pa.len() != b.1.len() || pa.len() % nu != 0 {
+        return false;
+    }
+    let nv = pa.len() / nu;
+    let close = |p: &[f64; 4], q: &[f64; 4]| norm(sub([p[0], p[1], p[2]], [q[0], q[1], q[2]])) <= tol && (p[3] - q[3]).abs() <= 1e-9;
+    for swap in [false, true] {
+        let bu = if swap { nv } else { nu };
+        if b.0 != bu {
+            continue;
+        }
+        for (ru, rv) in [(false, false), (true, false), (false, true), (true, true)] {
+            let matches = (0..nv).all(|j| {
+                (0..nu).all(|i| {
+                    let (i2, j2) = (if ru { nu - 1 - i } else { i }, if rv { nv - 1 - j } else { j });
+                    let k = if swap { i2 * bu + j2 } else { j2 * bu + i2 };
+                    matches!((pa.get(j * nu + i), b.1.get(k)), (Some(p), Some(q)) if close(p, q))
+                })
+            });
+            if matches {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Faces flipped so that every shared edge is used once each way (the trimmed surfaces of a
@@ -1578,6 +1680,10 @@ fn sew_surfaces(
         }
     }
     faces.extend(sew(t, sw, drafts));
+    let cancelled = cancel_coincident(t, faces);
+    if cancelled > 0 {
+        t.warn(format!("{cancelled} faces written twice over one another left out (each pair encloses nothing)"));
+    }
     if faces.is_empty() {
         return Ok(Vec::new());
     }
@@ -1640,6 +1746,9 @@ struct Draft {
     surface: u64,
     loops: Vec<Vec<Seg>>,
     color: Option<[f32; 3]>,
+    /// The file's surface entity it lies on, and that surface's placement: to tell faces that
+    /// are one face written twice ([`cancel_coincident`]).
+    base: (i64, Xf),
 }
 
 /// Gaps between the pieces of a trim loop wider than this (mm) are left open: past it, the ends
@@ -1736,7 +1845,7 @@ fn sew(t: &mut Tr, sw: &mut Sewer, faces: Vec<Draft>) -> Vec<FaceB> {
                         .collect()
                 })
                 .collect();
-            FaceB { surface: f.surface, sense: true, loops, color: f.color }
+            FaceB { surface: f.surface, sense: true, loops, color: f.color, base: f.base }
         })
         .collect()
 }
@@ -1764,7 +1873,7 @@ fn trimmed(t: &mut Tr, tol: f64, seq: i64) -> R<Draft> {
             if loops.is_empty() {
                 return Err("no boundary".into());
             }
-            Ok(Draft { surface, loops, color })
+            Ok(Draft { surface, loops, color, base: (surf_seq, xf) })
         }
         143 => {
             let surf_seq = t.i(seq, 2)?;
@@ -1780,13 +1889,13 @@ fn trimmed(t: &mut Tr, tol: f64, seq: i64) -> R<Draft> {
             if loops.is_empty() {
                 return Err("no boundary".into());
             }
-            Ok(Draft { surface, loops, color })
+            Ok(Draft { surface, loops, color, base: (surf_seq, xf) })
         }
         _ => {
             let surface = t.surface(seq, &Xf::ID)?;
             let outer = t.natural_boundary(seq, &Xf::ID)?;
             let l = loop_of(outer);
-            Ok(Draft { surface, loops: vec![l], color })
+            Ok(Draft { surface, loops: vec![l], color, base: (seq, Xf::ID) })
         }
     }
 }
@@ -2110,7 +2219,8 @@ fn brep_face(t: &mut Tr, sw: &mut Sewer, done: &mut HashMap<(i64, i64), (usize, 
     if t.de(seq)?.typ != 510 {
         return Err(format!("entity {seq} is not a face"));
     }
-    let surface = t.surface(t.i(seq, 1)?, xf)?;
+    let base = (t.i(seq, 1)?, *xf);
+    let surface = t.surface(base.0, xf)?;
     let nl = t.i(seq, 2)?.clamp(0, MAX_LIST as i64) as usize;
     let mut loops = Vec::new();
     for k in 0..nl {
@@ -2148,7 +2258,7 @@ fn brep_face(t: &mut Tr, sw: &mut Sewer, done: &mut HashMap<(i64, i64), (usize, 
     if loops.is_empty() {
         return Err("no loops".into());
     }
-    Ok(FaceB { surface, sense: true, loops, color: color_of(t, seq) })
+    Ok(FaceB { surface, sense: true, loops, color: color_of(t, seq), base })
 }
 
 /// Edge `ndx` (1-based) of an edge list (504) as a sewn edge.

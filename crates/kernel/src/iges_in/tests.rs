@@ -750,3 +750,19 @@ fn a_short_side_two_patches_share_stays_an_edge() {
     assert_eq!(imp.bodies.len(), 1, "{:?}", imp.warnings);
     assert_eq!(imp.bodies[0].body.face_count(), 2, "{:?}", imp.warnings);
 }
+
+/// Two boxes side by side, each closed on its own, write the face between them twice (as a
+/// submarine's upper and lower rudders, each capped where they meet). Every edge of that face
+/// was used by four faces, which no solid has, and the part was refused. The two copies enclose
+/// nothing and cancel: the boxes join into one solid of both volumes.
+#[test]
+fn a_face_written_twice_between_two_pieces_joins_them() {
+    let mut ents = Vec::new();
+    trimmed_box(&mut ents, 0.0);
+    trimmed_box(&mut ents, 10.0);
+    let imp = iges_import(&iges_file(&ents)).unwrap();
+    assert_eq!(imp.bodies.len(), 1, "{:?}", imp.warnings);
+    assert_eq!(imp.bodies[0].body.face_count(), 10, "{:?}", imp.warnings);
+    assert!(rel(measure(&imp.bodies[0].body).unwrap().volume, 2.0 * 10.0 * 20.0 * 30.0) < 1e-9, "{:?}", imp.warnings);
+    assert!(imp.warnings.iter().any(|w| w.contains("written twice")), "{:?}", imp.warnings);
+}
