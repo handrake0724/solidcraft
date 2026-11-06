@@ -807,6 +807,11 @@ impl<'a> Tr<'a> {
                 let cnt = (k1 + 1) * (k2 + 1);
                 let base_p = base_w + cnt;
                 // IGES runs the first index fastest: entry (i, j) is at j * (k1 + 1) + i.
+                let mut pts = Vec::with_capacity(cnt);
+                for idx in 0..cnt {
+                    pts.push(x.point(self.pt(seq, base_p + 3 * idx)?));
+                }
+                snap_poles(&mut pts, k1 + 1, k2 + 1, POLE_SNAP * self.tol);
                 let mut rows = Vec::new();
                 let mut wrows = Vec::new();
                 let mut rational = false;
@@ -820,7 +825,7 @@ impl<'a> Tr<'a> {
                             return Err(format!("entity {seq}: non-positive weight"));
                         }
                         rational |= (w - 1.0).abs() > 1e-12;
-                        let p = x.point(self.pt(seq, base_p + 3 * idx)?);
+                        let p = *pts.get(idx).ok_or("control point")?;
                         row.push(format!("#{}", self.o.point(p)));
                         wrow.push(r(w));
                     }
@@ -1057,11 +1062,23 @@ impl<'a> Tr<'a> {
         let s_knots: Vec<f64> = (0..n1).map(|j| self.n(seq, 10 + j)).collect::<R<_>>()?;
         let t_knots: Vec<f64> = (0..n2).map(|j| self.n(seq, 10 + n1 + j)).collect::<R<_>>()?;
         let base_w = 10 + n1 + n2;
-        let base_p = base_w + (k1 + 1) * (k2 + 1);
+        let cnt = k1
+            .checked_add(1)
+            .zip(k2.checked_add(1))
+            .and_then(|(a, b)| a.checked_mul(b))
+            .filter(|c| *c <= MAX_LIST)
+            .ok_or_else(|| format!("entity {seq}: B-spline surface too large"))?;
+        let base_p = base_w + cnt;
+        // The same control points the surface is written with ([`Tr::surface_new`]).
+        let mut pts = Vec::with_capacity(cnt);
+        for idx in 0..cnt {
+            pts.push(x.point(self.pt(seq, base_p + 3 * idx)?));
+        }
+        snap_poles(&mut pts, k1 + 1, k2 + 1, POLE_SNAP * self.tol);
         let h = |i: usize, j: usize| -> R<[f64; 4]> {
             let idx = j * (k1 + 1) + i;
             let w = self.n(seq, base_w + idx)?;
-            let p = x.point(self.pt(seq, base_p + 3 * idx)?);
+            let p = *pts.get(idx).ok_or("control point")?;
             Ok([p[0] * w, p[1] * w, p[2] * w, w])
         };
         // Clamped knot vectors: the boundary rows are the boundary curves.
@@ -1083,6 +1100,42 @@ impl<'a> Tr<'a> {
             out.push(if rev { seg.reversed() } else { seg });
         }
         Ok(out)
+    }
+}
+
+/// How far, as a multiple of the file's tolerance, the control points along a side of a B-spline
+/// surface (128) may lie from their centre and still be read as one point ([`snap_poles`]).
+const POLE_SNAP: f64 = 10.0;
+
+/// A side of a B-spline surface's control net (`ni` × `nj`, the first index fastest) whose
+/// points all lie within `reach` of their centre, made that one point: a pole. Exporters write a
+/// side meant to collapse (a deck patch running out to the stem) a few micrometres wide, which
+/// is neither a pole nor an edge to the reader: the side's few micrometres span its whole
+/// parameter range, so where its ends map in (u, v) is a guess, and a mirrored copy of a patch
+/// that read well (the same side, u and v swapped) was refused as a loop across a seam. Moving
+/// points by no more than `reach` leaves the surface where it was to within that.
+fn snap_poles(pts: &mut [V3], ni: usize, nj: usize, reach: f64) {
+    if ni < 2 || nj < 2 || pts.len() != ni * nj {
+        return;
+    }
+    let sides: [Vec<usize>; 4] = [
+        (0..ni).collect(),
+        (0..ni).map(|i| (nj - 1) * ni + i).collect(),
+        (0..nj).map(|j| j * ni).collect(),
+        (0..nj).map(|j| j * ni + ni - 1).collect(),
+    ];
+    for side in sides {
+        // The side's first point is the corner its neighbours start from: the pole goes there.
+        let Some(corner) = side.first().and_then(|&k| pts.get(k).copied()) else { continue };
+        let points: Vec<V3> = side.iter().filter_map(|&k| pts.get(k).copied()).collect();
+        if points.iter().all(|p| *p == corner) || !points.iter().all(|p| norm(sub(*p, corner)) <= reach) {
+            continue;
+        }
+        for &k in &side {
+            if let Some(p) = pts.get_mut(k) {
+                *p = corner;
+            }
+        }
     }
 }
 
