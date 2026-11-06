@@ -86,25 +86,20 @@ impl Assembly {
                 out.referenced.insert(definition);
             }
         }
-        // Index geometry references once instead of rescanning all parameters for each patch.
+        // A B-spline surface (128) another entity builds on (a trimmed or bounded surface's base, a
+        // face's surface) is not a part of its own. Only the fields that point at a surface count:
+        // any other parameter (a count, a degree, a coordinate written without a point) can equal
+        // a surface's directory number by chance, and the surface would be dropped unread.
         for (&seq, params) in &t.f.params {
             if watch.as_ref().is_some_and(|w| w.cancelled()) {
                 return Err("IGES import cancelled".into());
             }
-            if t.f.des.get(&seq).is_some_and(|d| matches!(d.typ, 308 | 402 | 406 | 408)) {
-                continue;
-            }
-            for p in params.iter().skip(1) {
-                let p = p.trim();
-                if p.starts_with('0') {
-                    continue;
-                }
-                if let Ok(id) = p.parse::<usize>()
-                    && id != seq
-                    && t.f.des.get(&id).is_some_and(|d| d.typ == 128)
-                {
-                    out.surface_references.insert(id);
-                }
+            let Some(field) = t.f.des.get(&seq).and_then(|d| surface_pointer(d.typ)) else { continue };
+            if let Some(id) = params.get(field).and_then(|p| p.trim().parse::<usize>().ok())
+                && id != seq
+                && t.f.des.get(&id).is_some_and(|d| d.typ == 128)
+            {
+                out.surface_references.insert(id);
             }
         }
         let mut depths = HashMap::with_capacity(out.groups.len());
@@ -226,6 +221,20 @@ impl Assembly {
             }
         }
         Ok(())
+    }
+}
+
+/// The parameter (counted after the entity type) that points at the surface an entity of type
+/// `typ` builds on: a trimmed surface's (144) and a bounded surface's (143) base, a boundary's
+/// (141) and a curve on a surface's (142) surface, an offset surface's (140) base, and a B-rep
+/// face's (510) surface. `None` for an entity that points at no surface.
+fn surface_pointer(typ: i64) -> Option<usize> {
+    match typ {
+        144 | 510 => Some(1),
+        142 | 143 => Some(2),
+        141 => Some(3),
+        140 => Some(5),
+        _ => None,
     }
 }
 
