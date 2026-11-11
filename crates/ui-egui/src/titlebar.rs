@@ -45,6 +45,8 @@ mod tests {
         maximized: bool,
         /// Lay out the whole window (`SolveApp::ui`) rather than only the bar and the zones.
         full: bool,
+        /// A floating window over the bar: one of the app's dialogs, placed with its top left there.
+        floating: Option<Rect>,
     }
 
     impl Win {
@@ -52,7 +54,7 @@ mod tests {
             let ctx = crate::fonts::test_context();
             let mut app = SolveApp::new(Session::default(), Default::default());
             app.custom_titlebar = true;
-            Self { ctx, app, width, time: 0.0, maximized: false, full: false }
+            Self { ctx, app, width, time: 0.0, maximized: false, full: false, floating: None }
         }
 
         /// One frame with `events`, the input going through `release_press_taken_by_os` first
@@ -70,7 +72,7 @@ mod tests {
             }
             // As the desktop app's raw-input hook does first.
             crate::window_chrome::release_press_taken_by_os(&self.ctx, &mut input);
-            let (app, full) = (&mut self.app, self.full);
+            let (app, full, floating) = (&mut self.app, self.full, self.floating);
             let mut out = self.ctx.run_ui(input, |ui| {
                 if full {
                     app.ui(ui);
@@ -79,6 +81,14 @@ mod tests {
                 crate::toolbar::app_bar(app, ui);
                 if app.custom_titlebar {
                     resize_zones(ui);
+                }
+                if let Some(r) = floating {
+                    // one of the app's own floating windows (a feature dialog), its header over the bar
+                    crate::ui_kit::Window::new(egui::Id::unique("test-floating-window"), "section", "Floating")
+                        .placed(egui::Align2::LEFT_TOP, r.min)
+                        .show_body(ui.ctx(), |ui| {
+                            ui.label("body");
+                        });
                 }
             });
             out.textures_delta.clear();
@@ -282,6 +292,34 @@ mod tests {
         let mut cmds = w.gesture(&[empty, empty + vec2(12.0, 4.0), empty + vec2(30.0, 8.0)]);
         cmds.extend(w.frame(vec![]).viewport_output.remove(&ViewportId::ROOT).map(|v| v.commands).unwrap_or_default());
         assert!(!cmds.iter().any(|c| matches!(c, ViewportCommand::Maximized(_))), "{cmds:?}");
+    }
+
+    /// A floating window's header over the bar takes the press in egui: the bar sends no
+    /// StartDrag (on macOS the main window still moved with it, but that was AppKit's own drag
+    /// of its title bar band, which the desktop app now turns off).
+    #[test]
+    fn a_floating_window_over_the_bar_is_dragged_not_the_main_window() {
+        let mut w = Win::new(1600.0);
+        w.frame(vec![]);
+        // its header lies over the bar's empty space
+        let empty = pos2(900.0, 17.0);
+
+        w.floating = Some(Rect::from_min_size(pos2(700.0, 5.0), vec2(500.0, 200.0)));
+        w.frame(vec![]);
+        w.frame(vec![]);
+        let cmds = w.gesture(&[empty, empty + vec2(12.0, 4.0), empty + vec2(30.0, 8.0)]);
+        assert!(!cmds.iter().any(|c| matches!(c, ViewportCommand::StartDrag)), "{cmds:?}");
+        w.time += 1.0;
+        let mut cmds = w.click(empty);
+        cmds.extend(w.click(empty));
+        assert!(!cmds.contains(&ViewportCommand::Maximized(true)), "{cmds:?}");
+        // with the window gone the bar moves the main window again
+        w.floating = None;
+        w.time += 1.0;
+        w.frame(vec![]);
+        w.frame(vec![]);
+        let cmds = w.gesture(&[empty, empty + vec2(12.0, 4.0), empty + vec2(30.0, 8.0)]);
+        assert_eq!(cmds.iter().filter(|c| matches!(c, ViewportCommand::StartDrag)).count(), 1, "{cmds:?}");
     }
 
     #[test]

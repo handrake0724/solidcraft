@@ -615,6 +615,19 @@ fn macos_fullscreen_content(ctx: &egui::Context, raw: &mut egui::RawInput) {
     fullscreen_content_insets(raw, frame.size.height as f32, ctx.zoom_factor());
 }
 
+/// The window's transparent title bar band (the top, under the application bar) is AppKit's to
+/// drag: a press there that egui gives to a floating window's header moved the main window too.
+/// The window is made not movable by the user, so the only drags are the ones the application
+/// bar starts itself (`titlebar::drag_area` → `StartDrag`, which AppKit performs anyway). Skipped
+/// quietly when there is no window yet.
+#[cfg(target_os = "macos")]
+fn macos_bar_drags_only() {
+    let Some(mtm) = objc2::MainThreadMarker::new() else { return };
+    for w in objc2_app_kit::NSApplication::sharedApplication(mtm).windows().iter() {
+        w.setMovable(false);
+    }
+}
+
 #[cfg(any(target_os = "macos", test))]
 fn fullscreen_content_insets(raw: &mut egui::RawInput, title_height: f32, zoom: f32) {
     let fullscreen = raw.viewports.get(&raw.viewport_id).and_then(|v| v.fullscreen).unwrap_or(false);
@@ -1314,6 +1327,8 @@ fn main() -> eframe::Result {
                 }
             }
             app.integrated_titlebar = cfg!(target_os = "macos");
+            #[cfg(target_os = "macos")]
+            macos_bar_drags_only();
             app.cpu_meshing = safe_mode;
             app.graphics_fallback = fallback_note.clone();
             let stored_ui = cc.storage.and_then(|s| solidcraft_ui_egui::prefs::stored(|k| s.get_string(k)));
