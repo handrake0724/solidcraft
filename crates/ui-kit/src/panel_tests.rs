@@ -2011,3 +2011,57 @@ fn a_left_panel_in_an_inside_out_view_keeps_an_anchor() {
     let anchor = panel.bounded_anchor(&ctx);
     assert!(anchor.x.is_finite() && anchor.y.is_finite(), "{anchor:?}");
 }
+
+/// A card kept to a rect stays in it: placed above it, anchored outside it, and dragged past
+/// its top by the header.
+#[test]
+fn a_window_constrained_to_a_rect_stays_inside_it() {
+    let ctx = crate::test_support::context();
+    let area = egui::Rect::from_min_max(egui::pos2(0.0, 200.0), egui::pos2(1400.0, 1000.0));
+    let mut time = 0.0;
+    let mut frame = |events: Vec<egui::Event>, anchored: bool| {
+        time += 1.0 / 60.0;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 1000.0))),
+            time: Some(time),
+            events,
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| {
+            let w = Window::new(egui::Id::unique("constrained_card"), "", "Constrained").constrain_to(area);
+            let w = if anchored {
+                w.anchor(egui::Align2::LEFT_TOP, egui::vec2(0.0, 0.0))
+            } else {
+                w.placed(egui::Align2::LEFT_TOP, egui::pos2(100.0, 50.0))
+            };
+            w.show_body(ui.ctx(), |ui| {
+                ui.label("body");
+            });
+        });
+        out.textures_delta.clear();
+        registry::rect_of("dialog:window").unwrap()
+    };
+    for _ in 0..4 {
+        frame(vec![], false);
+    }
+    let first = frame(vec![], false);
+    assert!(area.contains_rect(first), "placed above the rect: {first:?}");
+    // drag the header up and past the rect's top
+    let grip = egui::pos2(first.center().x, first.top() + 12.0);
+    let button =
+        |p: egui::Pos2, pressed| egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+    frame(vec![egui::Event::PointerMoved(grip)], false);
+    frame(vec![button(grip, true)], false);
+    for k in 1..=10 {
+        frame(vec![egui::Event::PointerMoved(grip - egui::vec2(0.0, 40.0 * k as f32))], false);
+    }
+    frame(vec![button(grip - egui::vec2(0.0, 400.0), false)], false);
+    let dragged = frame(vec![], false);
+    assert!(area.contains_rect(dragged), "dragged past the top: {dragged:?}");
+    // anchored at the screen's top left, it comes into the rect
+    for _ in 0..4 {
+        frame(vec![], true);
+    }
+    let anchored = frame(vec![], true);
+    assert!(area.contains_rect(anchored), "anchored outside the rect: {anchored:?}");
+}

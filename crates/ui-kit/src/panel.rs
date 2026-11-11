@@ -1001,6 +1001,7 @@ pub struct Window<'a> {
     title: &'a str,
     anchor: Option<(egui::Align2, egui::Vec2)>,
     placed: Option<(egui::Align2, egui::Pos2)>,
+    constrain: Option<egui::Rect>,
     ok: &'a str,
     cancel: &'a str,
     apply: Option<&'a str>,
@@ -1026,6 +1027,7 @@ impl<'a> Window<'a> {
             title,
             anchor: None,
             placed: None,
+            constrain: None,
             ok: "OK",
             cancel: "Cancel",
             apply: None,
@@ -1046,6 +1048,13 @@ impl<'a> Window<'a> {
     /// Pin the card at `align` of the screen, `offset` away (it then no longer moves).
     pub fn anchor(mut self, align: egui::Align2, offset: egui::Vec2) -> Self {
         self.anchor = Some((align, offset));
+        self
+    }
+
+    /// Keep the card inside `rect` (as the app's feature dialogs stay in the view): where it is
+    /// first placed, anchored or dragged. Without it the card can go anywhere on the screen.
+    pub fn constrain_to(mut self, rect: egui::Rect) -> Self {
+        self.constrain = Some(rect);
         self
     }
 
@@ -1311,6 +1320,10 @@ impl<'a> Window<'a> {
             .frame(frame)
             .fade_in(false)
             .fade_out(false);
+        let window = match self.constrain {
+            Some(r) => window.constrain_to(r),
+            None => window,
+        };
         let window = match (self.anchor, self.placed) {
             (Some((align, offset)), _) => window.anchor(align, offset),
             (None, Some((pivot, pos))) => window.pivot(pivot).default_pos(pos),
