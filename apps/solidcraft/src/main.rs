@@ -808,6 +808,19 @@ fn macos_fullscreen_title_bar() {
     }
 }
 
+/// The window's transparent title bar band (the top, under the application bar) is AppKit's to
+/// drag: a press there that egui gives to a floating window's header moved the main window too.
+/// The window is made not movable by the user, so the only drags are the ones the application
+/// bar starts itself (`titlebar::drag_area` → `StartDrag`, which AppKit performs anyway). Skipped
+/// quietly when there is no window yet.
+#[cfg(target_os = "macos")]
+fn macos_bar_drags_only() {
+    let Some(mtm) = objc2::MainThreadMarker::new() else { return };
+    for w in objc2_app_kit::NSApplication::sharedApplication(mtm).windows().iter() {
+        w.setMovable(false);
+    }
+}
+
 /// The full-screen title bar's window lets clicks through while it can't be seen.
 #[cfg(any(target_os = "macos", test))]
 fn hidden_title_bar_ignores_clicks(alpha: f64) -> bool {
@@ -1671,6 +1684,8 @@ fn main() -> eframe::Result {
                 }
             }
             app.integrated_titlebar = cfg!(target_os = "macos");
+            #[cfg(target_os = "macos")]
+            macos_bar_drags_only();
             app.cpu_meshing = safe_mode || safe;
             app.safe_graphics = safe;
             app.graphics_fallback = fallback_note.clone();
