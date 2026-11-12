@@ -234,8 +234,11 @@ pub(crate) fn plan_at(b: &brep::Brep, tol: f64, turn: Option<size::Turn>) -> Res
         let fp =
             FacePlan { flip: !fwd, triangles: if fwd { fp.triangles } else { fp.triangles.into_iter().map(|[a, b, c]| [a, c, b]).collect() }, ..fp };
         // Its poles of higher order and the normals they get, on the oriented triangles, by the
-        // kernel's evaluator ([`crate::pole`]).
-        let (poles, averaged) = crate::pole::plan_poles(fi, eval.kernel(), &fp, fb.reach);
+        // kernel's evaluator ([`crate::pole`]). A flat spline has none: every node, a pole too,
+        // takes its plane's normal (the limit there, of a plate crumpled into a point by the
+        // last digits of its control points, can be tens of degrees off it).
+        let (poles, averaged) =
+            if eval.flat().is_some() { (Vec::new(), Vec::new()) } else { crate::pole::plan_poles(fi, eval.kernel(), &fp, fb.reach) };
         let mut stats = stats;
         stats.averaged_poles = averaged;
         Ok((FacePlan { poles, ..fp }, stats))

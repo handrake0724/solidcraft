@@ -397,7 +397,7 @@ mod tests {
     fn a_spline_closed_on_itself_is_periodic_over_its_knot_interval() {
         let clamped = || vec![0.0, 0.0, 0.0, 0.25, 0.5, 0.75, 1.0, 1.0, 1.0];
         let s = ring([0.0; 4], clamped());
-        let EvalSurface::Nurbs { degree, knots, count, ctrl, closed: kept } = &s else { panic!("a spline") };
+        let EvalSurface::Nurbs { degree, knots, count, ctrl, closed: kept, .. } = &s else { panic!("a spline") };
         assert_eq!(closed(*degree, knots, *count, ctrl), [true, false]);
         assert_eq!(*kept, [true, false], "the constructor keeps what the test finds");
         assert_eq!(domain(&s).period, [Some(1.0), None]);

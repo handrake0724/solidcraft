@@ -243,10 +243,12 @@ impl TessPlan {
                     count,
                     ctrl,
                     closed,
+                    flat,
                 } => EvalSurface::Nurbs {
                     degree: *degree,
-                    // An affine map keeps a surface closed or open.
+                    // An affine map keeps a surface closed or open; a rotation a plane's normal unit.
                     closed: *closed,
+                    flat: flat.map(kvector),
                     knots: knots.clone(),
                     count: *count,
                     // Homogeneous: the translation scales with the weight.

@@ -571,9 +571,14 @@ fn pack(plans: &[&TessPlan]) -> Result<PackedPlans> {
                 push3(&mut data, solidcore_tess::record_vec3(*du));
                 push3(&mut data, solidcore_tess::record_vec3(*dv));
             }
-            EvalSurface::Nurbs { degree, knots, count, ctrl, closed } => {
+            EvalSurface::Nurbs { degree, knots, count, ctrl, closed, flat } => {
                 head[0] = 1;
-                head[11] = u32::from(closed[0]) | (u32::from(closed[1]) << 1);
+                // Bit 2: flat, its normal at `extra`.
+                head[11] = u32::from(closed[0]) | (u32::from(closed[1]) << 1) | (u32::from(flat.is_some()) << 2);
+                if let Some(n) = flat {
+                    head[8] = word(data.len())?;
+                    push3(&mut data, solidcore_tess::record_vec3(*n));
+                }
                 head[1] = word(degree[0])?;
                 head[2] = word(degree[1])?;
                 head[3] = word(count[0])?;

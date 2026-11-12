@@ -27,7 +27,8 @@ struct Surface {
     // Revolved: parameters exchanged; mirror transform (normal reversed).
     swap: u32,
     mirror: u32,
-    // NURBS: bit 0 the surface joins itself along u, bit 1 along v (the direction is periodic).
+    // NURBS: bit 0 the surface joins itself along u, bit 1 along v (the direction is periodic);
+    // bit 2 it is flat, its unit normal at `extra` (`EvalSurface::flat`).
     closed: u32,
 };
 
@@ -320,6 +321,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
             k = k + 1u;
         }
+    }
+    if (s.kind == 1u && (s.closed & 4u) != 0u) {
+        n = vec3<f32>(data[s.extra], data[s.extra + 1u], data[s.extra + 2u]);
     }
     var nn = vec3<f32>(0.0, 0.0, 1.0);
     if (length(n) > 0.0) {

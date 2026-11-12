@@ -96,6 +96,7 @@ fn a_face_crossing_itself() -> (EvalSurface, seam::Loop, size::Rules) {
         count: [3, 3],
         ctrl,
         closed: [false, false],
+        flat: None,
     };
     let corners = [[0.1, 0.1], [0.9, 0.1], [0.9, 0.7], [0.7, 0.95], [0.86, 0.8], [0.1, 0.9]];
     let mut uv: Vec<[f64; 2]> = Vec::new();
@@ -183,6 +184,7 @@ fn sag_refinement_across_an_inflection_ends_without_slivers() {
         count: [4, 2],
         ctrl,
         closed: [false, false],
+        flat: None,
     };
     // Boundary: bottom and top rows of n + 1 nodes (their sides within the tolerance, 0.5), A and
     // B halfway up the ends. Inside: C. Bottom fan from A, the triangle A B C, top fan from C.
@@ -237,6 +239,7 @@ fn triangles_standing_across_a_curved_sheet_are_flipped_along_it() {
         count: [3, 2],
         ctrl,
         closed: [false, false],
+        flat: None,
     };
     let uv = vec![[0.1, 0.5], [0.9, 0.5], [0.5, 0.52], [0.5, 0.48]];
     let mut tris = vec![[0, 1, 2], [1, 0, 3]];

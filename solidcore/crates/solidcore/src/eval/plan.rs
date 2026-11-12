@@ -45,6 +45,12 @@ pub const MAX_EVAL_KNOTS: usize = 1 << 12;
 pub const MAX_EVAL_POINTS: usize = 1 << 18;
 /// Basis slots for the highest evaluable degree.
 pub const W: usize = MAX_SPLINE_DEGREE + 1;
+/// A spline whose control points all lie within this share of their extent of one plane is
+/// taken as flat for its display normals: the normal from so slight a bend (under 1e-5 rad over
+/// the whole patch) cannot show, while the last digits of a flat patch's control points can
+/// turn its exact normal tens of degrees where it is crumpled into a pole (a ship's transom or
+/// deck collapsed to a point).
+const FLAT_SHARE: f64 = 1e-6;
 
 /// A rational B-spline curve: homogeneous control points `[x·w, y·w, z·w, w]`. Outside its
 /// domain it continues as the polynomial of the end span (a line extends for ever).
@@ -63,8 +69,9 @@ pub enum EvalSurface {
     /// A rational tensor B-spline; control point `(i, j)` is `ctrl[j·count[0] + i]`. `closed`:
     /// whether it closes on itself along each direction ([`uv::closed`]), worked out once by
     /// [`EvalSurface::nurbs`] (every evaluation outside the knot interval asks, and the test
-    /// walks the whole control net).
-    Nurbs { degree: [usize; 2], knots: [Vec<f64>; 2], count: [usize; 2], ctrl: Vec<[f64; 4]>, closed: [bool; 2] },
+    /// walks the whole control net). `flat`: the unit normal (oriented as `S_u × S_v`) of a
+    /// spline whose control points lie in one plane ([`FLAT_SHARE`]), which every point takes.
+    Nurbs { degree: [usize; 2], knots: [Vec<f64>; 2], count: [usize; 2], ctrl: Vec<[f64; 4]>, closed: [bool; 2], flat: Option<Vec3> },
     /// `profile(u)` turned by the angle `v` (right-handed) about the axis through `origin`
     /// along the unit `axis`, then mapped by the affine `transform` (row-major 3×4); with
     /// `swap` the parameters are exchanged first (the surface is evaluated at `(v, u)`).
@@ -119,17 +126,31 @@ impl EvalCurve {
 }
 
 impl EvalSurface {
-    /// The rational tensor B-spline [`EvalSurface::Nurbs`], with whether it closes on itself.
+    /// The rational tensor B-spline [`EvalSurface::Nurbs`], with whether it closes on itself
+    /// and whether it is flat.
     pub fn nurbs(degree: [usize; 2], knots: [Vec<f64>; 2], count: [usize; 2], ctrl: Vec<[f64; 4]>) -> EvalSurface {
         let closed = uv::closed(degree, &knots, count, &ctrl);
-        EvalSurface::Nurbs { degree, knots, count, ctrl, closed }
+        let flat = flat_normal(count, &ctrl);
+        EvalSurface::Nurbs { degree, knots, count, ctrl, closed, flat }
     }
 
-    /// Point and unit normal (`S_u × S_v`, oriented as the surface) at `(u, v)`. A degenerate
-    /// point (a cone's apex, a sphere's pole) takes its normal from a step inside; anything
-    /// that still fails gives the origin and +Z rather than a NaN.
+    /// The unit normal every point of a flat spline takes ([`EvalSurface::Nurbs`]'s `flat`).
+    pub fn flat(&self) -> Option<Vec3> {
+        match self {
+            EvalSurface::Nurbs { flat, .. } => *flat,
+            _ => None,
+        }
+    }
+
+    /// Point and unit normal (`S_u × S_v`, oriented as the surface) at `(u, v)`. A flat spline
+    /// takes its plane's normal everywhere. A degenerate point (a cone's apex, a sphere's pole)
+    /// takes its normal from a step inside; anything that still fails gives the origin and +Z
+    /// rather than a NaN.
     pub fn eval(&self, u: f64, v: f64) -> (Vec3, Vec3) {
         let Some((p, du, dv)) = self.derivs(u, v) else { return (Vec3::ZERO, Vec3::Z) };
+        if let Some(n) = self.flat() {
+            return (p, n);
+        }
         if let Some(n) = self.regular_normal(du, dv) {
             return (p, n);
         }
@@ -155,11 +176,12 @@ impl EvalSurface {
         n.normalized().filter(|_| n.len2() > 1e-20 * (du.len2() * dv.len2()).max(1e-300))
     }
 
-    /// Point and unit normal at `(u, v)` where the first partials give one there; `None` at a
-    /// degenerate point (a cone's apex, a sphere's pole) or off the surface.
+    /// Point and unit normal at `(u, v)` where the first partials give one there (a flat
+    /// spline's plane normal anywhere on it); `None` at a degenerate point (a cone's apex, a
+    /// sphere's pole) or off the surface.
     pub fn regular(&self, u: f64, v: f64) -> Option<(Vec3, Vec3)> {
         let (p, du, dv) = self.derivs(u, v)?;
-        Some((p, self.regular_normal(du, dv)?))
+        Some((p, self.flat().or_else(|| self.regular_normal(du, dv))?))
     }
 
     /// The active parameter interval along `d` (0: u, 1: v) of a spline, or of a revolution's
@@ -286,6 +308,42 @@ pub fn onto_knots(knots: &[f64], p: usize, n: usize, t: f64) -> Option<f64> {
 /// How far past its knot range, relative to the range's magnitude, a parameter is still the range's
 /// end: the room a pcurve's interval has for rounding (`brep::topology::PCURVE_INTERVAL`).
 const BOUNDARY_ROUNDING: f64 = 1e-9;
+
+/// The unit normal, oriented as `S_u × S_v`, of a spline whose control points (all of positive
+/// weight) lie within [`FLAT_SHARE`] of their extent of one plane; `None` for any other. The
+/// direction is the sum of the control net's quads' area vectors (two triangles each), which
+/// follows the parameters' handedness and ignores the quads collapsed into a pole.
+fn flat_normal(count: [usize; 2], ctrl: &[[f64; 4]]) -> Option<Vec3> {
+    let [nu, nv] = count;
+    if nu < 2 || nv < 2 || ctrl.len() != nu.checked_mul(nv)? {
+        return None;
+    }
+    let points: Vec<Vec3> = ctrl.iter().map(|c| (c[3] > 0.0).then(|| Vec3::new(c[0] / c[3], c[1] / c[3], c[2] / c[3]))).collect::<Option<_>>()?;
+    let at = |i: usize, j: usize| points.get(j * nu + i).copied();
+    let mut area = Vec3::ZERO;
+    let (mut lo, mut hi, mut sum) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3], Vec3::ZERO);
+    for j in 0..nv {
+        for i in 0..nu {
+            let p = at(i, j)?;
+            for ((l, h), x) in lo.iter_mut().zip(hi.iter_mut()).zip([p.x, p.y, p.z]) {
+                *l = l.min(x);
+                *h = h.max(x);
+            }
+            sum += p;
+            if i + 1 < nu && j + 1 < nv {
+                let (a, b, c) = (at(i + 1, j)?, at(i, j + 1)?, at(i + 1, j + 1)?);
+                area = area + (a - p).cross(b - p) + (c - b).cross(c - a);
+            }
+        }
+    }
+    let extent = Vec3::new(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]).len();
+    let n = area.normalized()?;
+    if !(extent.is_finite() && extent > 0.0 && area.len() > 1e-12 * extent * extent) {
+        return None;
+    }
+    let centre = sum * (1.0 / points.len() as f64);
+    points.iter().all(|p| (*p - centre).dot(n).abs() <= FLAT_SHARE * extent).then_some(n)
+}
 
 fn nurbs_second(degree: [usize; 2], knots: &[Vec<f64>; 2], count: [usize; 2], ctrl: &[[f64; 4]], u: f64, v: f64) -> Option<(Vec3, Vec3, Vec3)> {
     let [pu, pv] = degree;
@@ -472,6 +530,26 @@ mod tests {
     }
 
     const IDENTITY: [[f64; 4]; 3] = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]];
+
+    /// A flat fan patch in the plane x = 0 whose side u = 0 is a pole, over parameters as long as
+    /// a ship's transom exported from Rhino (0 to 15 000 by 0 to 10 000): every point, the pole
+    /// too, takes the plane's normal. A patch crumpled past the flat share is not flat.
+    #[test]
+    fn a_flat_spline_takes_its_planes_normal_everywhere_even_at_a_pole() {
+        let pole = [0.0, 0.0, 10_000.0, 1.0];
+        let knots = [vec![0.0, 0.0, 15_000.0, 15_000.0], vec![0.0, 0.0, 10_000.0, 10_000.0]];
+        let s = EvalSurface::nurbs([1, 1], knots.clone(), [2, 2], vec![pole, [0.0, -5_000.0, 0.0, 1.0], pole, [0.0, 5_000.0, 0.0, 1.0]]);
+        assert!(s.flat().is_some_and(|n| close(n, Vec3::X, 1e-12)), "{:?}", s.flat());
+        for (u, v) in [(0.0, 0.0), (0.0, 10_000.0), (0.0, 5_000.0), (7_500.0, 5_000.0)] {
+            let (_, n) = s.eval(u, v);
+            assert!(close(n, Vec3::X, 1e-12), "normal {n:?} at ({u}, {v})");
+            assert!(s.regular(u, v).is_some_and(|(_, n)| close(n, Vec3::X, 1e-12)), "regular at ({u}, {v})");
+        }
+        // A plate whose fourth corner stands a millimetre off the plane of the other three.
+        let corners = |x: f64| vec![[0.0, 0.0, 0.0, 1.0], [0.0, 5_000.0, 0.0, 1.0], [0.0, 0.0, 5_000.0, 1.0], [x, 5_000.0, 5_000.0, 1.0]];
+        assert!(EvalSurface::nurbs([1, 1], knots.clone(), [2, 2], corners(0.0)).flat().is_some());
+        assert_eq!(EvalSurface::nurbs([1, 1], knots, [2, 2], corners(1.0)).flat(), None);
+    }
 
     #[test]
     fn plane_point_and_normal() {

@@ -390,6 +390,7 @@ fn synthetic_plans() -> Vec<GeomPlan> {
         count: [3, 2],
         ctrl,
         closed: [true, false],
+        flat: None,
     };
     let profile = EvalCurve { degree: 1, knots: vec![0.0, 0.0, 1.0, 1.0], ctrl: vec![[2.0, 0.0, 0.0, 1.0], [3.0, 0.0, 1.5, 1.0]] };
     let revolved = EvalSurface::Revolved {
