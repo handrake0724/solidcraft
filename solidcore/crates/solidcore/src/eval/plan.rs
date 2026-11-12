@@ -279,6 +279,36 @@ impl EvalSurface {
             EvalSurface::Revolved { .. } => None,
         }
     }
+
+    /// The surface's largest principal curvature in magnitude at `(u, v)` (1/length), from its
+    /// first and second fundamental forms, for the display's curvature map; zero on a plane or a
+    /// flat spline. `None` at a singular point (no tangent plane to bend from) or where the
+    /// surface cannot be evaluated.
+    pub fn curvature(&self, u: f64, v: f64) -> Option<f64> {
+        if matches!(self, EvalSurface::Plane { .. }) || self.flat().is_some() {
+            return Some(0.0);
+        }
+        let (su, sv, suu, suv, svv) = if let EvalSurface::Revolved { .. } = self {
+            let d = self.partials(u, v)?;
+            let at = |i: usize, j: usize| d.get(i).and_then(|r| r.get(j)).copied();
+            (at(1, 0)?, at(0, 1)?, at(2, 0)?, at(1, 1)?, at(0, 2)?)
+        } else {
+            let (_, su, sv) = self.derivs(u, v)?;
+            let (suu, suv, svv) = self.second(u, v)?;
+            (su, sv, suu, suv, svv)
+        };
+        let (e, f, g) = (su.dot(su), su.dot(sv), sv.dot(sv));
+        let det = e * g - f * f;
+        if !(det > 1e-12 * e * g) {
+            return None;
+        }
+        let n = su.cross(sv).normalized()?;
+        let (l, m, nn) = (suu.dot(n), suv.dot(n), svv.dot(n));
+        let gauss = (l * nn - m * m) / det;
+        let mean = (e * nn - 2.0 * f * m + g * l) / (2.0 * det);
+        let k = mean.abs() + (mean * mean - gauss).max(0.0).sqrt();
+        k.is_finite().then_some(k)
+    }
 }
 
 /// The values and first two derivatives of the `p + 1` basis functions of degree `p` alive at
@@ -530,6 +560,39 @@ mod tests {
     }
 
     const IDENTITY: [[f64; 4]; 3] = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]];
+
+    /// The curvature the map shows: a plane's and a flat spline's zero, a cylinder's its
+    /// radius's reciprocal, a saddle's its larger principal curvature in magnitude.
+    #[test]
+    fn curvature_is_the_largest_principal_curvature() {
+        let plane = EvalSurface::Plane { origin: Vec3::ZERO, du: Vec3::X, dv: Vec3::Y };
+        assert_eq!(plane.curvature(3.0, 4.0), Some(0.0));
+        let unit = [vec![0.0, 0.0, 1.0, 1.0], vec![0.0, 0.0, 1.0, 1.0]];
+        let flat = EvalSurface::nurbs([1, 1], unit, [2, 2], vec![[0.0, 0.0, 0.0, 1.0], [5.0, 0.0, 0.0, 1.0], [0.0, 5.0, 0.0, 1.0], [5.0, 5.0, 0.0, 1.0]]);
+        assert_eq!(flat.curvature(0.5, 0.5), Some(0.0));
+        // A quarter cylinder of radius 2 along Y, as a rational quadratic by a line.
+        let w = std::f64::consts::FRAC_1_SQRT_2;
+        let arc = [[2.0, 0.0, 0.0, 1.0], [2.0 * w, 0.0, 2.0 * w, w], [0.0, 0.0, 2.0, 1.0]];
+        let ctrl: Vec<[f64; 4]> = [0.0, 7.0].iter().flat_map(|&y| arc.map(|c| [c[0], y * c[3], c[2], c[3]])).collect();
+        let cylinder = EvalSurface::nurbs([2, 1], [vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0], vec![0.0, 0.0, 1.0, 1.0]], [3, 2], ctrl);
+        for u in [0.0, 0.3, 0.5, 1.0] {
+            let k = cylinder.curvature(u, 0.4).unwrap_or(f64::NAN);
+            assert!((k - 0.5).abs() < 1e-9, "cylinder curvature {k} at {u}");
+        }
+        // z = x² - y²/4 near the origin: principal curvatures 2 and -1/2 there.
+        let s = EvalSurface::nurbs(
+            [2, 2],
+            [vec![-1.0, -1.0, -1.0, 1.0, 1.0, 1.0], vec![-1.0, -1.0, -1.0, 1.0, 1.0, 1.0]],
+            [3, 3],
+            [-1.0f64, 0.0, 1.0]
+                .iter()
+                .flat_map(|&y| [-1.0f64, 0.0, 1.0].map(|x| [x, y]))
+                .map(|[x, y]| [x, y, if x == 0.0 { -1.0 } else { 1.0 } - 0.25 * if y == 0.0 { -1.0 } else { 1.0 }, 1.0])
+                .collect(),
+        );
+        let k = s.curvature(0.0, 0.0).unwrap_or(f64::NAN);
+        assert!((k - 2.0).abs() < 1e-9, "saddle curvature {k}");
+    }
 
     /// A flat fan patch in the plane x = 0 whose side u = 0 is a pole, over parameters as long as
     /// a ship's transom exported from Rhino (0 to 15 000 by 0 to 10 000): every point, the pole

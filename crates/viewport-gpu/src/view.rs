@@ -37,13 +37,17 @@ mod product_highlights;
 pub use msaa_check::MsaaCheck;
 
 /// Triangle vertex: position (3 × f32), normal (3 × f32), palette index (u32) at
-/// [`TRI_COLOR_AT`], and a value at [`TRI_VALUE_AT`] (an `f32`'s bits, or [`NO_VALUE`]) that
-/// [`solidcraft_viewport::AnalysisMode::Values`] colours by.
-pub const TRI_SIZE: usize = 32;
+/// [`TRI_COLOR_AT`], a value at [`TRI_VALUE_AT`] (an `f32`'s bits, or [`NO_VALUE`]) that
+/// [`solidcraft_viewport::AnalysisMode::Values`] colours by, and the surface's curvature at
+/// [`TRI_CURVATURE_AT`] (largest principal, 1/mm; negative where it is not known) that the
+/// curvature map shows.
+pub const TRI_SIZE: usize = 36;
 /// Where a triangle vertex keeps its palette index.
 pub const TRI_COLOR_AT: usize = 24;
 /// Where a triangle vertex keeps its value.
 pub const TRI_VALUE_AT: usize = 28;
+/// Where a triangle vertex keeps its curvature.
+pub const TRI_CURVATURE_AT: usize = 32;
 /// A triangle vertex's value word when it has no value (a NaN's bits no producer writes).
 pub const NO_VALUE: u32 = u32::MAX;
 pub const PBR_SIZE: usize = pbr::VERTEX_SIZE;
@@ -452,8 +456,9 @@ impl std::hash::Hasher for WeldHasher {
     }
 }
 
-/// A vertex of [`SharedTris`]: position and normal (3 × f32 each).
-pub const SHARED_SIZE: usize = 24;
+/// A vertex of [`SharedTris`]: position and normal (3 × f32 each), then the surface's
+/// curvature there (f32; negative when unknown, as for [`TRI_SIZE`]).
+pub const SHARED_SIZE: usize = 28;
 
 /// A mesh's triangles as an [`InstancedMesh`] draws them: each vertex once, shared by the
 /// triangles that meet there, and the triangles as indices into them, so the GPU transforms each
@@ -477,6 +482,11 @@ impl SharedTris {
     /// alone when every triangle is flat.
     pub fn new(mesh: &solidcore_tess::Mesh) -> SharedTris {
         let corner = |i: u32| Some((mesh.positions.get(i as usize)?.to_f32(), mesh.normals.get(i as usize)?.to_f32()));
+        // A rigid placement keeps the curvature; a mesh without it (an STL's) has none.
+        let curvature = |i: u32| {
+            if mesh.curvature.len() == mesh.positions.len() { mesh.curvature.get(i as usize).copied() } else { None }
+                .unwrap_or(solidcore_tess::UNKNOWN_CURVATURE)
+        };
         let bits = |v: [f32; 3]| v.map(|x| (x + 0.0).to_bits());
         let flat = mesh.triangles.iter().all(|t| {
             let [a, b, c] = t.map(|i| corner(i).map(|(_, n)| bits(n)));
@@ -488,12 +498,12 @@ impl SharedTris {
             std::collections::HashMap::with_capacity_and_hasher(mesh.positions.len() / 2, Default::default());
         for t in &mesh.triangles {
             let [Some(a), Some(b), Some(c)] = t.map(corner) else { continue };
-            for (p, n) in [a, b, c] {
+            for ((p, n), i) in [a, b, c].into_iter().zip(*t) {
                 let [x, y, z] = bits(p);
                 let [a, b, c] = if flat { [0; 3] } else { bits(n) };
                 let next = u32::try_from(out.vertices.len() / SHARED_SIZE).unwrap_or(u32::MAX);
                 let index = *seen.entry([x, y, z, a, b, c]).or_insert_with(|| {
-                    for v in p.iter().chain(&n) {
+                    for v in p.iter().chain(&n).chain(&[if flat { solidcore_tess::UNKNOWN_CURVATURE } else { curvature(i) }]) {
                         out.vertices.extend_from_slice(&v.to_le_bytes());
                     }
                     next
@@ -505,7 +515,7 @@ impl SharedTris {
         let mut lo = [f32::INFINITY; 3];
         let mut hi = [f32::NEG_INFINITY; 3];
         for v in 0..out.vertices.len() / SHARED_SIZE {
-            let (p, _) = out.vertex(v as u32);
+            let (p, _, _) = out.vertex(v as u32);
             for k in 0..3 {
                 lo[k] = lo[k].min(p[k]);
                 hi[k] = hi[k].max(p[k]);
@@ -569,7 +579,7 @@ impl SharedTris {
                 lo[k] = lo[k].min(p[k]);
                 hi[k] = hi[k].max(p[k]);
             }
-            for v in p.iter().chain(&[0.0f32; 3]) {
+            for v in p.iter().chain(&[0.0f32; 3]).chain(&[solidcore_tess::UNKNOWN_CURVATURE]) {
                 out.vertices.extend_from_slice(&v.to_le_bytes());
             }
         }
@@ -579,27 +589,27 @@ impl SharedTris {
         out
     }
 
-    /// Vertex `i`: position and normal.
-    fn vertex(&self, i: u32) -> ([f32; 3], [f32; 3]) {
+    /// Vertex `i`: position, normal and curvature.
+    fn vertex(&self, i: u32) -> ([f32; 3], [f32; 3], f32) {
         let at = i as usize * SHARED_SIZE;
         let f = |k: usize| self.vertices.get(at + 4 * k..at + 4 * k + 4).and_then(|x| x.try_into().ok()).map_or(0.0, f32::from_le_bytes);
-        ([f(0), f(1), f(2)], [f(3), f(4), f(5)])
+        ([f(0), f(1), f(2)], [f(3), f(4), f(5)], f(6))
     }
 
-    /// Each triangle's corners (position, and the normal they are lit with: a flat triangle's
-    /// own), in the part's frame.
-    pub fn corners(&self) -> impl Iterator<Item = [([f32; 3], [f32; 3]); 3]> + '_ {
+    /// Each triangle's corners (position, the normal they are lit with: a flat triangle's own,
+    /// and the curvature), in the part's frame.
+    pub fn corners(&self) -> impl Iterator<Item = [([f32; 3], [f32; 3], f32); 3]> + '_ {
         self.indices.as_chunks::<3>().0.iter().map(move |t| {
             let c = t.map(|i| self.vertex(i));
             if !self.flat {
                 return c;
             }
-            let [a, b, d] = c.map(|(p, _)| p);
+            let [a, b, d] = c.map(|(p, _, _)| p);
             let (u, v) = ([b[0] - a[0], b[1] - a[1], b[2] - a[2]], [d[0] - a[0], d[1] - a[1], d[2] - a[2]]);
             let n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
             let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
             let n = if len > 0.0 { n.map(|x| x / len) } else { [0.0; 3] };
-            c.map(|(p, _)| (p, n))
+            c.map(|(p, _, k)| (p, n, k))
         })
     }
 
@@ -608,8 +618,8 @@ impl SharedTris {
     fn unshared(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.indices.len() * SHARED_SIZE);
         for t in self.corners() {
-            for (p, n) in t {
-                for v in p.iter().chain(&n) {
+            for (p, n, k) in t {
+                for v in p.iter().chain(&n).chain(&[k]) {
                     out.extend_from_slice(&v.to_le_bytes());
                 }
             }
@@ -731,14 +741,10 @@ impl InstancedMesh {
             let row = |r: usize| [f(inst, 16 * r), f(inst, 16 * r + 4), f(inst, 16 * r + 8), f(inst, 16 * r + 12)];
             let rows = [row(0), row(1), row(2)];
             let index = inst.get(48..52).and_then(|b| b.try_into().ok()).map_or(0, u32::from_le_bytes);
-            for (p, n) in self.tris.corners().flatten() {
+            for (p, n, k) in self.tris.corners().flatten() {
                 let moved = rows.map(|r| r[0] * p[0] + r[1] * p[1] + r[2] * p[2] + r[3]);
                 let turned = rows.map(|r| r[0] * n[0] + r[1] * n[1] + r[2] * n[2]);
-                for x in moved.iter().chain(&turned) {
-                    out.extend_from_slice(&x.to_le_bytes());
-                }
-                out.extend_from_slice(&index.to_le_bytes());
-                out.extend_from_slice(&NO_VALUE.to_le_bytes());
+                push_record(out, moved, turned, PaletteIndex(index), NO_VALUE, k);
             }
         }
     }
@@ -954,11 +960,17 @@ impl GpuScene {
 
 /// One triangle vertex record ([`TRI_SIZE`]) onto `out`.
 fn push_tri(out: &mut Vec<u8>, p: [f32; 3], n: [f32; 3], c: PaletteIndex, value: u32) {
+    push_record(out, p, n, c, value, -1.0);
+}
+
+/// One [`TRI_SIZE`] vertex record: position, normal, palette index, value word, curvature.
+fn push_record(out: &mut Vec<u8>, p: [f32; 3], n: [f32; 3], c: PaletteIndex, value: u32, k: f32) {
     for v in p.iter().chain(&n) {
         out.extend_from_slice(&v.to_le_bytes());
     }
     out.extend_from_slice(&c.0.to_le_bytes());
     out.extend_from_slice(&value.to_le_bytes());
+    out.extend_from_slice(&k.to_le_bytes());
 }
 
 /// A class's triangles as `TRI_SIZE` vertex records: its runs of the block's vertices, in order.
@@ -1205,20 +1217,26 @@ impl BlockBuilder {
 
     /// Add a triangle (three positions and normals, one palette index) under `class`.
     pub fn triangle(&mut self, p: [[f32; 3]; 3], n: [[f32; 3]; 3], c: PaletteIndex, class: TriClass) {
-        self.triangle_words(p, n, [NO_VALUE; 3], c, class);
+        self.triangle_words(p, n, [NO_VALUE; 3], [-1.0; 3], c, class);
+    }
+
+    /// [`BlockBuilder::triangle`] with the surface's curvature at each vertex (negative where it
+    /// is not known): what the curvature map shows.
+    pub fn triangle_curved(&mut self, p: [[f32; 3]; 3], n: [[f32; 3]; 3], k: [f32; 3], c: PaletteIndex, class: TriClass) {
+        self.triangle_words(p, n, [NO_VALUE; 3], k, c, class);
     }
 
     /// [`BlockBuilder::triangle`] with a value at each vertex, interpolated across it: what
     /// [`solidcraft_viewport::AnalysisMode::Values`] colours by.
     pub fn triangle_values(&mut self, p: [[f32; 3]; 3], n: [[f32; 3]; 3], values: [f32; 3], c: PaletteIndex, class: TriClass) {
-        self.triangle_words(p, n, values.map(f32::to_bits), c, class);
+        self.triangle_words(p, n, values.map(f32::to_bits), [-1.0; 3], c, class);
     }
 
-    fn triangle_words(&mut self, p: [[f32; 3]; 3], n: [[f32; 3]; 3], values: [u32; 3], c: PaletteIndex, class: TriClass) {
+    fn triangle_words(&mut self, p: [[f32; 3]; 3], n: [[f32; 3]; 3], values: [u32; 3], k: [f32; 3], c: PaletteIndex, class: TriClass) {
         let at = u32::try_from(self.vertices.len() / TRI_SIZE).unwrap_or(u32::MAX);
         let mut record = [0u8; 3 * TRI_SIZE];
-        for (((out, p), n), value) in record.as_chunks_mut::<TRI_SIZE>().0.iter_mut().zip(p).zip(n).zip(values) {
-            let words = [p[0].to_bits(), p[1].to_bits(), p[2].to_bits(), n[0].to_bits(), n[1].to_bits(), n[2].to_bits(), c.0, value];
+        for ((((out, p), n), value), k) in record.as_chunks_mut::<TRI_SIZE>().0.iter_mut().zip(p).zip(n).zip(values).zip(k) {
+            let words = [p[0].to_bits(), p[1].to_bits(), p[2].to_bits(), n[0].to_bits(), n[1].to_bits(), n[2].to_bits(), c.0, value, k.to_bits()];
             for (w, slot) in words.iter().zip(out.as_chunks_mut::<4>().0) {
                 *slot = w.to_le_bytes();
             }
@@ -1310,11 +1328,7 @@ impl GpuScene {
         }
     }
     pub fn tri(&mut self, p: [f32; 3], n: [f32; 3], c: PaletteIndex) {
-        for v in p.iter().chain(&n) {
-            self.tris.extend_from_slice(&v.to_le_bytes());
-        }
-        self.tris.extend_from_slice(&c.0.to_le_bytes());
-        self.tris.extend_from_slice(&NO_VALUE.to_le_bytes());
+        corner(&mut self.tris, p, n, -1.0, c);
     }
     /// [`GpuScene::tri`] with a value ([`TRI_VALUE_AT`]), for a mesh coloured by its values.
     pub fn tri_value(&mut self, p: [f32; 3], n: [f32; 3], c: PaletteIndex, value: f32) {
@@ -1330,11 +1344,7 @@ impl GpuScene {
     }
     /// A vertex of an open body's opaque triangle (see [`GpuScene::open_tris`]).
     pub fn open_tri(&mut self, p: [f32; 3], n: [f32; 3], c: PaletteIndex) {
-        for v in p.iter().chain(&n) {
-            self.open_tris.extend_from_slice(&v.to_le_bytes());
-        }
-        self.open_tris.extend_from_slice(&c.0.to_le_bytes());
-        self.open_tris.extend_from_slice(&NO_VALUE.to_le_bytes());
+        corner(&mut self.open_tris, p, n, -1.0, c);
     }
     /// A vertex of a hovered face (see [`GpuScene::hover_faces`]).
     pub fn hover_face_tri(&mut self, p: [f32; 3], n: [f32; 3], c: PaletteIndex) {
@@ -1342,18 +1352,10 @@ impl GpuScene {
     }
     /// A vertex of the ground-plane shadow (see [`GpuScene::shadow`]).
     pub fn shadow_tri(&mut self, p: [f32; 3], c: PaletteIndex) {
-        for v in p.iter().chain(&[0.0; 3]) {
-            self.shadow.extend_from_slice(&v.to_le_bytes());
-        }
-        self.shadow.extend_from_slice(&c.0.to_le_bytes());
-        self.shadow.extend_from_slice(&NO_VALUE.to_le_bytes());
+        corner(&mut self.shadow, p, [0.0; 3], -1.0, c);
     }
     pub fn trans_tri(&mut self, p: [f32; 3], n: [f32; 3], c: PaletteIndex) {
-        for v in p.iter().chain(&n) {
-            self.trans.extend_from_slice(&v.to_le_bytes());
-        }
-        self.trans.extend_from_slice(&c.0.to_le_bytes());
-        self.trans.extend_from_slice(&NO_VALUE.to_le_bytes());
+        corner(&mut self.trans, p, n, -1.0, c);
     }
     /// A line shown only where the model hides it.
     pub fn hidden_line(&mut self, a: [f32; 3], b: [f32; 3], c: PaletteIndex, width: f32) {
@@ -1367,25 +1369,13 @@ impl GpuScene {
         let _ = self.hidden.try_reserve(hidden.saturating_mul(LINE_SIZE));
     }
     pub fn glass_tri(&mut self, p: [f32; 3], n: [f32; 3], c: PaletteIndex) {
-        for v in p.iter().chain(&n) {
-            self.glass.extend_from_slice(&v.to_le_bytes());
-        }
-        self.glass.extend_from_slice(&c.0.to_le_bytes());
-        self.glass.extend_from_slice(&NO_VALUE.to_le_bytes());
+        corner(&mut self.glass, p, n, -1.0, c);
     }
     pub fn ghost_tri(&mut self, p: [f32; 3], n: [f32; 3], c: PaletteIndex) {
-        for v in p.iter().chain(&n) {
-            self.ghost.extend_from_slice(&v.to_le_bytes());
-        }
-        self.ghost.extend_from_slice(&c.0.to_le_bytes());
-        self.ghost.extend_from_slice(&NO_VALUE.to_le_bytes());
+        corner(&mut self.ghost, p, n, -1.0, c);
     }
     pub fn xray_tri(&mut self, p: [f32; 3], n: [f32; 3], c: PaletteIndex) {
-        for v in p.iter().chain(&n) {
-            self.xray.extend_from_slice(&v.to_le_bytes());
-        }
-        self.xray.extend_from_slice(&c.0.to_le_bytes());
-        self.xray.extend_from_slice(&NO_VALUE.to_le_bytes());
+        corner(&mut self.xray, p, n, -1.0, c);
     }
     /// A line under everything (see [`GpuScene::under`]).
     pub fn under_line(&mut self, a: [f32; 3], b: [f32; 3], c: PaletteIndex, width: f32) {
@@ -1397,11 +1387,7 @@ impl GpuScene {
     }
     /// A translucent triangle of a plane a section does not cut (see [`GpuScene::guide_trans`]).
     pub fn guide_tri(&mut self, p: [f32; 3], c: PaletteIndex) {
-        for v in p.iter().chain(&[0.0; 3]) {
-            self.guide_trans.extend_from_slice(&v.to_le_bytes());
-        }
-        self.guide_trans.extend_from_slice(&c.0.to_le_bytes());
-        self.guide_trans.extend_from_slice(&NO_VALUE.to_le_bytes());
+        corner(&mut self.guide_trans, p, [0.0; 3], -1.0, c);
     }
     /// A depth-tested line a section does not cut (see [`GpuScene::guide_lines`]).
     pub fn guide_line(&mut self, a: [f32; 3], b: [f32; 3], c: PaletteIndex, width: f32) {
@@ -1428,6 +1414,13 @@ impl GpuScene {
         let out = if on_top { &mut self.overlay } else { &mut self.lines };
         out.extend_from_slice(&line_record(a, b, c, width.to_bits()));
     }
+}
+
+/// One CPU-built triangle corner's [`TRI_SIZE`] bytes appended to `out`: its position, normal,
+/// the surface's curvature there (negative when unknown: the curvature map then reads how the
+/// normal turns on screen) and its palette index.
+pub(crate) fn corner(out: &mut Vec<u8>, p: [f32; 3], n: [f32; 3], k: f32, c: PaletteIndex) {
+    push_record(out, p, n, c, NO_VALUE, k);
 }
 
 /// One line's [`LINE_SIZE`] bytes: its ends, its palette index and its width word (an `f32`'s
@@ -3080,6 +3073,9 @@ pub struct Renderer {
     /// `tri` and `tri_cut` for planned bodies (positions and normals from the GPU evaluation,
     /// colours per vertex, indexed).
     tri_planned: wgpu::RenderPipeline,
+    /// `tri_planned` while the curvature map is on, where the device evaluates plans: each
+    /// fragment's curvature from its surface at its parameters ([`EXACT_SHADER`]).
+    tri_planned_exact: Option<wgpu::RenderPipeline>,
     tri_cut_planned: Option<Cut>,
     /// `tri` and `tri_cut` for instanced meshes (shared triangles, a move and colour per
     /// placement).
@@ -3439,8 +3435,17 @@ impl Group0 {
     }
 }
 
+/// The curvature map's exact evaluation for planned bodies, appended to [`SHADER`] where the
+/// device can (storage buffers in the fragment stage).
+pub const EXACT_SHADER: &str = include_str!("view/exact.wgsl");
+
+/// The storage buffers [`EXACT_SHADER`] binds in the fragment stage (none on WebGL2).
+const EXACT_STORAGE_BUFFERS: u32 = 2;
+
+/// A triangle corner built on the CPU ([`TRI_SIZE`]): position, normal, palette index, value
+/// word, curvature (negative where unknown).
 fn tri_layout() -> wgpu::VertexBufferLayout<'static> {
-    const A: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Uint32, 3 => Uint32];
+    const A: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Uint32, 3 => Uint32, 7 => Float32];
     wgpu::VertexBufferLayout { array_stride: TRI_SIZE as u64, step_mode: wgpu::VertexStepMode::Vertex, attributes: &A }
 }
 
@@ -3452,16 +3457,26 @@ fn pbr_layout() -> wgpu::VertexBufferLayout<'static> {
 }
 
 fn planned_layout() -> wgpu::VertexBufferLayout<'static> {
-    const A: [wgpu::VertexAttribute; 2] = [
+    const A: [wgpu::VertexAttribute; 3] = [
         wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 0, shader_location: 0 },
         wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: crate::NORMAL_OFFSET, shader_location: 1 },
+        wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32, offset: crate::CURVATURE_OFFSET, shader_location: 7 },
     ];
     wgpu::VertexBufferLayout { array_stride: crate::VERTEX_STRIDE, step_mode: wgpu::VertexStepMode::Vertex, attributes: &A }
 }
 
+/// A planned body's parameters and surface per vertex ([`crate::GpuMesh::parameters`]).
+fn parameter_layout() -> wgpu::VertexBufferLayout<'static> {
+    const A: [wgpu::VertexAttribute; 2] = [
+        wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 0, shader_location: 8 },
+        wgpu::VertexAttribute { format: wgpu::VertexFormat::Uint32, offset: crate::SURFACE_OFFSET, shader_location: 9 },
+    ];
+    wgpu::VertexBufferLayout { array_stride: crate::PARAMETER_STRIDE, step_mode: wgpu::VertexStepMode::Vertex, attributes: &A }
+}
+
 /// An instanced mesh's vertices ([`SHARED_SIZE`]).
 fn shared_layout() -> wgpu::VertexBufferLayout<'static> {
-    const A: [wgpu::VertexAttribute; 2] = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
+    const A: [wgpu::VertexAttribute; 3] = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 7 => Float32];
     wgpu::VertexBufferLayout { array_stride: SHARED_SIZE as u64, step_mode: wgpu::VertexStepMode::Vertex, attributes: &A }
 }
 
@@ -3611,7 +3626,13 @@ impl Renderer {
     /// kind. When the two differ (a 1× window pass with no depth, say, and a multisampled scene
     /// target), the scene is always drawn offscreen and blitted into the window's pass.
     pub fn with_window_target(device: &wgpu::Device, t: GpuTarget, window: GpuTarget, tess: Option<crate::TessGpu>) -> Self {
-        let source = format!("{SHADER}\n{}", pbr::SOURCE);
+        // Where plans are evaluated on the GPU, the curvature map evaluates their surfaces at every
+        // pixel too (storage buffers in the fragment stage, which WebGL2 has not).
+        // The window's renderer is made before the evaluation compiles beside it (`TessLater`),
+        // so this goes by the device, as [`tessellation`] does, not by `t.tess`.
+        let exact_on = device.limits().max_storage_buffers_per_shader_stage >= EXACT_STORAGE_BUFFERS;
+        let exact_source = if exact_on { EXACT_SHADER } else { "" };
+        let source = format!("{SHADER}\n{}\n{exact_source}", pbr::SOURCE);
         let module =
             device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("sc_viewport"), source: wgpu::ShaderSource::Wgsl(source.into()) });
         let studio_layout = Environment::layout_entries();
@@ -4075,6 +4096,39 @@ impl Renderer {
             )
         };
         let caps = || (cap(TriSource::Built), cap(TriSource::Planned), cap(TriSource::Instanced));
+        // `sc_tris_planned` with the surfaces bound (group 3) and each vertex's parameters.
+        let exact_access = access_bgl.clone();
+        let exact = || {
+            exact_on.then(|| {
+                let surfaces = crate::exact_layout(device);
+                let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("sc_solid_exact"),
+                    bind_group_layouts: &[Some(&bgl), Some(&exact_access), Some(&ao_layout), Some(&surfaces)],
+                    immediate_size: 0,
+                });
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("sc_tris_planned_exact"),
+                    layout: Some(&layout),
+                    vertex: wgpu::VertexState {
+                        module: &module,
+                        entry_point: Some("vs_tri_exact"),
+                        buffers: &[Some(planned_layout()), Some(color_layout()), Some(parameter_layout())],
+                        compilation_options: Default::default(),
+                    },
+                    primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
+                    depth_stencil: opaque(),
+                    multisample: wgpu::MultisampleState { count: t.samples.max(1), mask: !0, alpha_to_coverage_enabled: false },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &module,
+                        entry_point: Some("fs_solid_exact"),
+                        targets: &[Some(wgpu::ColorTargetState { format: t.format, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+                        compilation_options: Default::default(),
+                    }),
+                    multiview_mask: None,
+                    cache: None,
+                })
+            })
+        };
         let flat = || (solid("sc_tris_instanced_flat", "fs_solid", None, opaque(), TriSource::InstancedFlat), marks(TriSource::InstancedFlat));
         let flat_cap = || cap(TriSource::InstancedFlat);
         let hover = || {
@@ -4174,6 +4228,7 @@ impl Renderer {
         // as its pipeline is made, which took seconds one after another (#4860).
         crate::concurrent::scope(device, |jobs| {
             let tris = jobs.spawn(tris);
+            let exact = jobs.spawn(exact);
             let caps = jobs.spawn(caps);
             let flat = jobs.spawn(flat);
             let flat_cap = jobs.spawn(flat_cap);
@@ -4194,6 +4249,7 @@ impl Renderer {
             let resets = jobs.spawn(resets);
             let studio = jobs.spawn(crate::environment::tables);
             let (tri, tri_marks, tri_planned, planned_marks, tri_instanced, instanced_marks) = tris.join();
+            let tri_planned_exact = exact.join();
             let (tri_cap, planned_cap, instanced_cap) = caps.join();
             let (tri_instanced_flat, flat_marks) = flat.join();
             let (tri_hl_hover, tri_hl_hover_built, tri_hl_hover_instanced, tri_hl_hover_instanced_flat) = hover.join();
@@ -4305,6 +4361,7 @@ impl Renderer {
                 tri,
                 tri_cut: cut(tri_marks, tri_cap),
                 tri_planned,
+                tri_planned_exact,
                 tri_cut_planned: cut(planned_marks, planned_cap),
                 tri_instanced,
                 tri_cut_instanced: cut(instanced_marks, instanced_cap),
@@ -5247,6 +5304,20 @@ impl Renderer {
                 tally.triangles(d.mesh.index_count, 1);
             }
         };
+        // While the curvature map is on: the planned bodies with each pixel's own curvature.
+        let curvature_map = (2.5..3.5).contains(&cb.analysis[0]);
+        let planned_exact = |pass: &mut wgpu::RenderPass<'static>, p: &wgpu::RenderPipeline, b: &Batches| {
+            for d in b.planned.iter().filter(|d| d.class == TriClass::Opaque) {
+                pass.set_pipeline(p);
+                pass.set_bind_group(3, &d.mesh.exact, &[]);
+                pass.set_vertex_buffer(0, d.mesh.vertices.slice(..));
+                pass.set_vertex_buffer(1, d.colors.slice(..));
+                pass.set_vertex_buffer(2, d.mesh.parameters.slice(..));
+                pass.set_index_buffer(d.mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..d.mesh.index_count, 0, 0..1);
+                tally.triangles(d.mesh.index_count, 1);
+            }
+        };
         // Instanced meshes, with the pipeline for smooth and for flat triangles.
         let instanced =
             |pass: &mut wgpu::RenderPass<'static>, smooth: &wgpu::RenderPipeline, flat: &wgpu::RenderPipeline, b: &Batches, counting: bool| {
@@ -5349,7 +5420,10 @@ impl Renderer {
                 tris(pass, &res.tri, &m.tris);
                 tris(pass, &res.tri, &m.open_tris);
                 block_class(pass, &res.tri, TriClass::Opaque);
-                planned(pass, &res.tri_planned, m, false);
+                match res.tri_planned_exact.as_ref().filter(|_| curvature_map) {
+                    Some(exact) => planned_exact(pass, exact, m),
+                    None => planned(pass, &res.tri_planned, m, false),
+                }
                 instanced(pass, &res.tri_instanced, &res.tri_instanced_flat, m, false);
                 in_moving(pass, &|pass, mv| {
                     tris(pass, &res.tri, &mv.tris);
@@ -6332,7 +6406,7 @@ mod tests {
         assert_eq!(shared.vertices.len() / SHARED_SIZE, 4, "the diagonal's ends are shared");
         assert_eq!(shared.indices.len(), 6);
         let corners: Vec<_> = shared.corners().flatten().collect();
-        for (k, (q, n)) in corners.iter().enumerate() {
+        for (k, (q, n, _)) in corners.iter().enumerate() {
             assert_eq!(*q, flat.positions[k].to_f32());
             assert!((n[2] - 1.0).abs() < 1e-6, "{n:?}");
         }
@@ -6352,7 +6426,7 @@ mod tests {
         let shared = SharedTris::new(&smooth);
         assert!(!shared.flat);
         assert_eq!(shared.vertices.len() / SHARED_SIZE, 5, "corner 0 differs in normal only");
-        let back: Vec<_> = shared.corners().flatten().map(|(_, n)| n).collect();
+        let back: Vec<_> = shared.corners().flatten().map(|(_, n, _)| n).collect();
         assert_eq!(back, smooth.normals.iter().map(|n| n.to_f32()).collect::<Vec<_>>());
         // Indices past the vertices: the triangle is left out, nothing panics.
         smooth.triangles.push([0, 1, 99]);
@@ -6427,6 +6501,11 @@ mod tests {
     #[test]
     fn shader_is_valid() {
         let module = naga::front::wgsl::parse_str(super::SHADER).unwrap_or_else(|e| panic!("{}", e.emit_to_string(super::SHADER)));
+        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty()).validate(&module).unwrap();
+        // With the curvature map's exact evaluation appended, as a device with storage buffers in
+        // the fragment stage builds it.
+        let full = format!("{}\n{}\n{}", super::SHADER, crate::pbr::SOURCE, super::EXACT_SHADER);
+        let module = naga::front::wgsl::parse_str(&full).unwrap_or_else(|e| panic!("{}", e.emit_to_string(&full)));
         naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty()).validate(&module).unwrap();
     }
 

@@ -57,8 +57,8 @@ fn two_circle_cut_on_face(s: &mut Session, component: u64, occurrence: u64, face
     (commands, sketch)
 }
 
-/// The vertices the cut preview draws as the see-through red tool (`GpuScene::xray`: records of
-/// `TRI_SIZE` bytes, position first), as their world bounds.
+/// The vertices the cut preview draws as the see-through red tool (`GpuScene::xray`: `TRI_SIZE`-byte
+/// records, position first), as their world bounds.
 fn tool_bounds(xray: &[u8]) -> (Vec3, Vec3) {
     assert!(!xray.is_empty() && xray.len().is_multiple_of(crate::gpu::TRI_SIZE), "the cut preview must draw its tool");
     let (mut lo, mut hi) = ([f64::MAX; 3], [f64::MIN; 3]);

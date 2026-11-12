@@ -53,7 +53,7 @@ pub mod table;
 /// solidcore-tess's (RFC 0003, item 1.1), under their old path.
 pub mod tess {
     pub use solidcore::eval::plan::*;
-    pub use solidcore_tess::{FacePlan, TessPlan};
+    pub use solidcore_tess::{FacePlan, TessPlan, UNKNOWN_CURVATURE};
 
     use solidcore_record::Vec3;
 

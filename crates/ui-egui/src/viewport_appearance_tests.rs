@@ -147,7 +147,10 @@ fn line_color(scene: &crate::gpu::GpuScene, line: &[u8]) -> [u8; 4] {
 
 /// The first vertex's palette index and its colour.
 fn first_vertex(scene: &crate::gpu::GpuScene, vertices: &[u8]) -> (u32, Option<[u8; 4]>) {
-    let index = vertices.get(24..28).and_then(|b| b.try_into().ok()).map_or(0, u32::from_le_bytes);
+    let index = vertices
+        .get(solidcraft_viewport_gpu::view::TRI_COLOR_AT..solidcraft_viewport_gpu::view::TRI_COLOR_AT + 4)
+        .and_then(|b| b.try_into().ok())
+        .map_or(0, u32::from_le_bytes);
     (index, scene.palette.get(crate::gpu::PaletteIndex(index)))
 }
 

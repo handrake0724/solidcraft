@@ -2296,7 +2296,7 @@ mod tests {
         bytes
             .chunks(stride)
             .filter(|v| {
-                let Some(i) = v.get(24..28).and_then(|b| b.try_into().ok()).map(u32::from_le_bytes) else { return false };
+                let Some(i) = v.get(stride - 4..stride).and_then(|b| b.try_into().ok()).map(u32::from_le_bytes) else { return false };
                 scene.palette.get(crate::gpu::PaletteIndex(i)) == Some(col)
             })
             .count()

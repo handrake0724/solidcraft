@@ -18,6 +18,7 @@ fn cube_mesh(s: f64) -> Mesh {
         smooth_edges: vec![],
         sharp_edges: vec![],
         edge_faces: vec![],
+        curvature: vec![],
     }
 }
 

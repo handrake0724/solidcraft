@@ -1936,15 +1936,21 @@ impl BodyDraw {
         };
         out.open_body(!self.closed);
         if shaded && !self.on_gpu {
+            // The exact curvature only while it has one value per vertex (see `Mesh::curvature`).
+            let curvature = (m.curvature.len() == m.positions.len()).then_some(&m.curvature);
             let corner = |k: u32| {
                 let i = k as usize;
-                (m.positions.get(i).copied().unwrap_or(Vec3::ZERO).to_f32(), m.normals.get(i).copied().unwrap_or(Vec3::ZERO).to_f32())
+                (
+                    m.positions.get(i).copied().unwrap_or(Vec3::ZERO).to_f32(),
+                    m.normals.get(i).copied().unwrap_or(Vec3::ZERO).to_f32(),
+                    curvature.and_then(|c| c.get(i)).copied().unwrap_or(solidcraft_engine::geom::tess::UNKNOWN_CURVATURE),
+                )
             };
             // Exactly three vertices per triangle, in mesh order: a class change regenerates the
             // runs without touching the vertices (see `reindex_block`).
             for (ti, t) in m.triangles.iter().enumerate() {
                 let [a, b, c] = t.map(corner);
-                out.triangle([a.0, b.0, c.0], [a.1, b.1, c.1], color(ti), class(ti));
+                out.triangle_curved([a.0, b.0, c.0], [a.1, b.1, c.1], [a.2, b.2, c.2], color(ti), class(ti));
             }
         }
         let placed = |p: Vec3| self.place.as_ref().map_or(p, |m| solidcraft_engine::doc::apply_point(m, p));
@@ -11206,7 +11212,8 @@ mod tests {
         assert!(scene.trans.is_empty(), "the ground shadow must not trigger order-independent transparency");
         assert_eq!(scene.shadow.len(), 48 * 5 * 3 * crate::gpu::TRI_SIZE, "all shadow rings are retained");
         let shadow_alpha = |v: &[u8]| {
-            let i = u32::from_le_bytes(v.get(24..28)?.try_into().ok()?);
+            let at = solidcraft_viewport_gpu::view::TRI_COLOR_AT;
+            let i = u32::from_le_bytes(v.get(at..at + 4)?.try_into().ok()?);
             scene.palette.get(crate::gpu::PaletteIndex(i)).map(|c| c[3])
         };
         assert!(scene.shadow.as_chunks::<{ crate::gpu::TRI_SIZE }>().0.iter().any(|v| shadow_alpha(v).is_some_and(|a| a > 0)));

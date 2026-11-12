@@ -36,7 +36,17 @@ pub struct Mesh {
     /// Per edge: the B-rep faces it bounds (one or two).
     #[serde(default)]
     pub edge_faces: Vec<Vec<u32>>,
+    /// Per vertex, the surface's exact curvature for the curvature map
+    /// ([`solidcore::eval::plan::EvalSurface::curvature`]), [`UNKNOWN_CURVATURE`] where it is not
+    /// known; display only. Read only while it has one value per position (an operation that
+    /// adds or drops vertices without it leaves it unread).
+    #[serde(skip)]
+    pub curvature: Vec<f32>,
 }
+
+/// [`Mesh::curvature`] where the curvature is not known: the display then reads it from how the
+/// normals turn.
+pub const UNKNOWN_CURVATURE: f32 = -1.0;
 
 impl Mesh {
     /// Visibility in shaded edge presentation, independent of selection/topology.

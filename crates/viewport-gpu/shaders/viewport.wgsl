@@ -178,28 +178,33 @@ struct TOut {
     // every vertex shader that gives none: a struct's fields start at zero).
     @location(4) v: f32,
     @location(5) @interpolate(flat) hv: u32,
+    // The surface's curvature (largest principal, 1/mm), worked out exactly at each vertex;
+    // negative where it is not known (the curvature map then reads it from the normals).
+    @location(6) k: f32,
 };
 
 /// A built triangle's vertex: its value word is an f32's bits, or all ones for none
 /// (`NO_VALUE`).
 @vertex
-fn vs_tri(@location(0) local: vec3<f32>, @location(1) n: vec3<f32>, @location(2) c: u32, @location(3) value: u32) -> TOut {
-    var o = tri_vertex(local, n, c);
+fn vs_tri(@location(0) local: vec3<f32>, @location(1) n: vec3<f32>, @location(2) c: u32, @location(3) value: u32, @location(7) k: f32) -> TOut {
+    var o = tri_vertex(local, n, c, k);
     let none = value == 0xffffffffu;
     o.v = select(bitcast<f32>(value), 0.0, none);
     o.hv = select(1u, 0u, none);
     return o;
 }
 
-/// A vertex evaluated from a display plan on the GPU (no value).
+/// A vertex evaluated from a display plan on the GPU (no value), with its exact curvature.
 @vertex
-fn vs_tri_planned(@location(0) local: vec3<f32>, @location(1) n: vec3<f32>, @location(2) c: u32) -> TOut {
-    return tri_vertex(local, n, c);
+fn vs_tri_planned(@location(0) local: vec3<f32>, @location(1) n: vec3<f32>, @location(2) c: u32, @location(7) k: f32) -> TOut {
+    return tri_vertex(local, n, c, k);
 }
 
-/// A triangle vertex at `local` with normal `n` in palette entry `c`, without a value.
-fn tri_vertex(local: vec3<f32>, n: vec3<f32>, c: u32) -> TOut {
+/// A triangle vertex at `local` with normal `n` in palette entry `c` and curvature `k`, without
+/// a value.
+fn tri_vertex(local: vec3<f32>, n: vec3<f32>, c: u32, k: f32) -> TOut {
     var o: TOut;
+    o.k = k;
     let e = palette_entry(c);
     let m = motion_of(e);
     let p = placed_by(m, local);
@@ -214,7 +219,8 @@ fn tri_vertex(local: vec3<f32>, n: vec3<f32>, c: u32) -> TOut {
 /// Shared triangles (in their part's own frame) drawn at one placement: the rows of its rigid
 /// move (`r0`..`r2`, a point's coordinates are their dot products with (p, 1)) and its colour,
 /// then moved like the rest of its scene (`placed`: a dragged component's layer).
-/// The vertex colour (location 2) is not read.
+/// The vertex colour (location 2) is not read; the curvature (location 7) is the part's own, a
+/// rigid move keeping it.
 @vertex
 fn vs_tri_inst(
     @location(0) p: vec3<f32>,
@@ -223,6 +229,7 @@ fn vs_tri_inst(
     @location(4) r1: vec4<f32>,
     @location(5) r2: vec4<f32>,
     @location(6) c: u32,
+    @location(7) k: f32,
     @location(9) s: u32,
 ) -> TOut {
     let q = vec4<f32>(p, 1.0);
@@ -233,6 +240,7 @@ fn vs_tri_inst(
     var o: TOut;
     o.pos = u.vp * vec4<f32>(wp, 1.0);
     o.n = turned_by(m, pn);
+    o.k = k;
     o.c = unpack_color(e.x);
     o.h = finish_h(c, e.y & 255u);
     o.wp = wp;
@@ -286,6 +294,7 @@ fn flat_fragment(i: FOut, front: bool) -> TOut {
     o.c = i.c;
     o.h = i.h;
     o.wp = i.rp + u.eye.xyz;
+    o.k = -1.0;
     return o;
 }
 
@@ -508,9 +517,13 @@ fn fs_section_fill_flat(i: FOut, @builtin(front_facing) front: bool) -> @locatio
 }
 
 fn solid(i: TOut, front: bool) -> vec4<f32> {
+    return solid_k(i, front, curvature(i));
+}
+
+/// `solid` with the curvature `k` (see `curvature`) worked out by the caller.
+fn solid_k(i: TOut, front: bool, k: f32) -> vec4<f32> {
     // Derivatives first, in uniform control flow (browsers' WGSL compilers reject them after
     // a branch that returns; the whole shader module then fails and nothing is drawn).
-    let k = curvature(i);
     let ndv = dot(normalize(i.n), normalize(u.back.xyz));
     let fw = fwidth(ndv);
     if (clipped(i.wp)) { discard; }
@@ -701,12 +714,14 @@ fn occlusion_term(i: TOut) -> f32 {
     return 1.0 - 0.85 * blocked / f32(count);
 }
 
-/// How fast the normal turns across the pixel (per mm).
+/// The surface's curvature here (per mm): the exact one interpolated from the vertices where
+/// they carry it, else how fast the normal turns across the pixel. Derivatives in uniform
+/// control flow either way.
 fn curvature(i: TOut) -> f32 {
     let nn = normalize(i.n);
     let kx = length(dpdx(nn)) / max(length(dpdx(i.wp)), 1e-6);
     let ky = length(dpdy(nn)) / max(length(dpdy(i.wp)), 1e-6);
-    return max(kx, ky);
+    return select(max(kx, ky), i.k, i.k >= 0.0);
 }
 
 /// Surface analysis colours: zebra stripes, draft angle bands, curvature map (`k`: the
@@ -779,7 +794,7 @@ fn analysis(i: TOut, k: f32) -> vec4<f32> {
         if (a <= -u.ana.y) { c = stripe(i, u.ana_c[2].rgb); }
         return out_color(vec4<f32>(c * lit, 1.0));
     }
-    // Curvature from how fast the normal turns across the pixel.
+    // Curvature (see `curvature`) against the map's radius.
     let t = clamp(k * u.ana.y, 0.0, 1.0);
     return out_color(vec4<f32>(ramp(t) * lit, 1.0));
 }

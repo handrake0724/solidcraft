@@ -570,14 +570,25 @@ pub fn scene_geometry(scene: &Scene) -> GpuScene {
             let flat = (b - a).cross(c - a).normalized().unwrap_or(Vec3::Z);
             for (k, p) in t.iter().zip([a, b, c]) {
                 let n = mesh.normals.get(*k as usize).copied().filter(|n| n.is_finite() && n.len() > 0.5).unwrap_or(flat);
-                // A mesh with values gives each vertex its own ([`SceneMesh::values`]).
+                // A mesh with values gives each vertex its own ([`SceneMesh::values`]); else the
+                // exact curvature while the mesh has one per vertex (`Mesh::curvature`), as the
+                // window draws it.
                 match m.values.as_ref().and_then(|v| v.get(*k as usize)).copied() {
                     Some(value) if m.glass() => sc.glass_tri_value(p.to_f32(), n.to_f32(), col, value),
                     Some(value) if m.closed => sc.tri_value(p.to_f32(), n.to_f32(), col, value),
                     Some(value) => sc.open_tri_value(p.to_f32(), n.to_f32(), col, value),
-                    None if m.glass() => sc.glass_tri(p.to_f32(), n.to_f32(), col),
-                    None if m.closed => sc.tri(p.to_f32(), n.to_f32(), col),
-                    None => sc.open_tri(p.to_f32(), n.to_f32(), col),
+                    None => {
+                        let curvature = if mesh.curvature.len() == mesh.positions.len() { mesh.curvature.get(*k as usize).copied() } else { None }
+                            .unwrap_or(solidcore_tess::UNKNOWN_CURVATURE);
+                        let out = if m.glass() {
+                            &mut sc.glass
+                        } else if m.closed {
+                            &mut sc.tris
+                        } else {
+                            &mut sc.open_tris
+                        };
+                        crate::view::corner(out, p.to_f32(), n.to_f32(), curvature, col);
+                    }
                 }
             }
         }
