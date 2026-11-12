@@ -173,10 +173,13 @@ pub enum GpuError {
 pub type Result<T> = std::result::Result<T, GpuError>;
 
 /// Bytes per evaluated vertex in [`GpuMesh::vertices`]: the position (x, y, z, 1) then the
-/// normal (x, y, z, 0), each four f32.
+/// normal and the curvature (x, y, z, curvature: unknown, negative, as the evaluation leaves it;
+/// the curvature map evaluates the surface at each pixel instead), each four f32.
 pub const VERTEX_STRIDE: u64 = std::mem::size_of::<[f32; VERTEX_WORDS]>() as u64;
 /// Byte offset of the normal within a vertex.
 pub const NORMAL_OFFSET: u64 = 16;
+/// Byte offset of the curvature within a vertex.
+pub const CURVATURE_OFFSET: u64 = 28;
 
 /// A plan on the GPU: its inputs, and the buffers the evaluation writes and a render pass
 /// reads. Evaluated once [`TessGpu::record`] has run in a submitted encoder.
@@ -191,10 +194,35 @@ pub struct GpuMesh {
     pub vertex_face: Vec<u32>,
     /// Per plan (in the order given), its vertices and indices.
     pub parts: Vec<Part>,
+    /// Per vertex: its parameters and surface, as the evaluation reads them (see
+    /// [`PARAMETER_STRIDE`]); a storage and vertex buffer.
+    pub parameters: wgpu::Buffer,
+    /// The surfaces and their data, for a fragment shader that evaluates them (see
+    /// [`exact_layout`]).
+    pub exact: wgpu::BindGroup,
     bind: wgpu::BindGroup,
     workgroups: u32,
     // The inputs, kept until the evaluation has run.
-    _inputs: [wgpu::Buffer; 4],
+    _inputs: [wgpu::Buffer; 3],
+}
+
+/// Bytes per vertex in [`GpuMesh::parameters`]: u and v (f32) at 0, the surface (u32) at
+/// [`SURFACE_OFFSET`], then the evaluation's own words.
+pub const PARAMETER_STRIDE: u64 = (VERTEX_WORDS * 4) as u64;
+/// Byte offset of the surface index within a vertex of [`GpuMesh::parameters`].
+pub const SURFACE_OFFSET: u64 = 8;
+
+/// The layout of [`GpuMesh::exact`]: the surface headers and their data, read-only storage
+/// buffers for the fragment stage. Every call describes the same layout, which the device takes
+/// as one (the viewport's pipeline and each mesh's bind group are made apart).
+pub fn exact_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    let entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
+        count: None,
+    };
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("viewport exact surfaces"), entries: &[entry(0), entry(1)] })
 }
 
 /// One plan's share of a [`GpuMesh`]: its vertices and its entries in the index buffer.
@@ -214,6 +242,7 @@ pub struct TessGpu {
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
     layout: wgpu::BindGroupLayout,
+    exact_layout: wgpu::BindGroupLayout,
 }
 
 impl TessGpu {
@@ -232,6 +261,7 @@ impl TessGpu {
         // capture them, so a device that cannot run the shader only loses GPU tessellation.
         let scopes = [wgpu::ErrorFilter::OutOfMemory, wgpu::ErrorFilter::Internal, wgpu::ErrorFilter::Validation].map(|f| device.push_error_scope(f));
         let (pipeline, layout) = Self::build(&device, shader);
+        let exact_layout = exact_layout(&device);
         let mut failed = None;
         for scope in scopes.into_iter().rev() {
             if let Some(e) = popped(scope.pop()) {
@@ -251,6 +281,7 @@ impl TessGpu {
             queue,
             pipeline,
             layout,
+            exact_layout,
         })
     }
 
@@ -378,7 +409,8 @@ impl TessGpu {
         let params = tess_buffer::<[u32; 4]>(d, "tess params", words(&[count, 0, 0, 0]), wgpu::BufferUsages::UNIFORM);
         let surfaces = tess_buffer::<[u32; SURFACE_WORDS]>(d, "tess surfaces", words(&packed.surfaces), wgpu::BufferUsages::STORAGE);
         let data = tess_buffer::<f32>(d, "tess data", floats(&packed.data), wgpu::BufferUsages::STORAGE);
-        let verts = tess_buffer::<[u32; VERTEX_WORDS]>(d, "tess vertices", words(&packed.vertices), wgpu::BufferUsages::STORAGE);
+        let verts =
+            tess_buffer::<[u32; VERTEX_WORDS]>(d, "tess vertices", words(&packed.vertices), wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::VERTEX);
         let vertices = d.create_buffer(&wgpu::BufferDescriptor {
             label: Some("tess mesh vertices"),
             size: (packed.count.max(1) as u64) * VERTEX_STRIDE,
@@ -413,6 +445,14 @@ impl TessGpu {
                 wgpu::BindGroupEntry { binding: 4, resource: vertices.as_entire_binding() },
             ],
         });
+        let exact = d.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("tess mesh surfaces"),
+            layout: &self.exact_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: surfaces.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: data.as_entire_binding() },
+            ],
+        });
         Ok(GpuMesh {
             vertices,
             indices,
@@ -420,9 +460,11 @@ impl TessGpu {
             vertex_count: count,
             vertex_face,
             parts,
+            parameters: verts,
+            exact,
             bind,
             workgroups: if packed.surfaces.is_empty() { 0 } else { count.div_ceil(WORKGROUP) },
-            _inputs: [params, surfaces, data, verts],
+            _inputs: [params, surfaces, data],
         })
     }
 

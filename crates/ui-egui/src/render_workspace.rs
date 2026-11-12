@@ -3454,7 +3454,7 @@ pub fn gpu_scene_cached(
                             }
                             (p[k], n[k]) = (position, normal);
                         }
-                        builder.triangle(p, n, slot, class);
+                        builder.triangle(p, n, [solidcraft_engine::geom::tess::UNKNOWN_CURVATURE; 3], slot, class);
                     }
                 }
                 builder.freeze()

@@ -504,13 +504,18 @@ pub fn scene_geometry(scene: &Scene) -> GpuScene {
             let flat = (b - a).cross(c - a).normalized().unwrap_or(Vec3::Z);
             for (k, p) in t.iter().zip([a, b, c]) {
                 let n = mesh.normals.get(*k as usize).copied().filter(|n| n.is_finite() && n.len() > 0.5).unwrap_or(flat);
-                if m.glass() {
-                    sc.glass_tri(p.to_f32(), n.to_f32(), col);
+                // The exact curvature while the mesh has one per vertex (`Mesh::curvature`), as
+                // the window draws it.
+                let curvature = if mesh.curvature.len() == mesh.positions.len() { mesh.curvature.get(*k as usize).copied() } else { None }
+                    .unwrap_or(solidcore_tess::UNKNOWN_CURVATURE);
+                let out = if m.glass() {
+                    &mut sc.glass
                 } else if m.closed {
-                    sc.tri(p.to_f32(), n.to_f32(), col);
+                    &mut sc.tris
                 } else {
-                    sc.open_tri(p.to_f32(), n.to_f32(), col);
-                }
+                    &mut sc.open_tris
+                };
+                crate::view::corner(out, p.to_f32(), n.to_f32(), curvature, col);
             }
         }
     }

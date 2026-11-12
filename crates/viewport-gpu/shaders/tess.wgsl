@@ -337,5 +337,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         p = vert.p.xyz;
     }
     out[2u * i] = vec4<f32>(p, 1.0);
-    out[2u * i + 1u] = vec4<f32>(nn, 0.0);
+    // w: the curvature, not known here (negative); the curvature map works it out per pixel.
+    out[2u * i + 1u] = vec4<f32>(nn, -1.0);
 }

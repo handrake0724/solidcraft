@@ -1366,7 +1366,7 @@ mod tests {
         bytes
             .chunks(stride)
             .filter(|v| {
-                let Some(i) = v.get(24..28).and_then(|b| b.try_into().ok()).map(u32::from_le_bytes) else { return false };
+                let Some(i) = v.get(stride - 4..stride).and_then(|b| b.try_into().ok()).map(u32::from_le_bytes) else { return false };
                 scene.palette.get(crate::gpu::PaletteIndex(i)) == Some(col)
             })
             .count()
@@ -1379,11 +1379,11 @@ mod tests {
         let p = s.preview(&[("solid.hole".to_string(), json!({"position": [20, 15, 20], "diameter": 5, "depth": 10}))]).unwrap();
         let b = build(&p.before, &p.after, colors());
         // The hole's walls are drawn see-through in the cut colour (seen from any side).
-        assert!(count(&b.scene, &b.scene.xray, 28, colors().removed) > 0);
+        assert!(count(&b.scene, &b.scene.xray, crate::gpu::TRI_SIZE, colors().removed) > 0);
         // A feature that only adds material shows no cut.
         let p = s.preview(&[("solid.box".to_string(), json!({"length": 10, "width": 10, "height": 30, "operation": "join"}))]).unwrap();
         let b = build(&p.before, &p.after, colors());
-        assert_eq!(count(&b.scene, &b.scene.xray, 28, colors().removed), 0);
+        assert_eq!(count(&b.scene, &b.scene.xray, crate::gpu::TRI_SIZE, colors().removed), 0);
     }
 
     /// Graphics' Show removed material in red, off: the cut and the ghost of the shape the
@@ -1396,19 +1396,19 @@ mod tests {
         let p = s.preview(&cmds).unwrap();
         let plain = colors();
         let b = build(&p.before, &p.after, plain);
-        assert!(count(&b.scene, &b.scene.ghost, 28, plain.removed) > 0, "the replaced shape is ghosted while the tint is on");
+        assert!(count(&b.scene, &b.scene.ghost, crate::gpu::TRI_SIZE, plain.removed) > 0, "the replaced shape is ghosted while the tint is on");
         let quiet = Colors { cut_tint: false, ..plain };
         let b = build(&p.before, &p.after, quiet);
-        assert_eq!(count(&b.scene, &b.scene.xray, 28, quiet.removed), 0, "no see-through cut");
-        assert_eq!(count(&b.scene, &b.scene.ghost, 28, quiet.removed), 0, "no ghost of the old shape");
-        assert!(count(&b.scene, &b.scene.tris, 28, quiet.body) > 0, "the body is still drawn");
+        assert_eq!(count(&b.scene, &b.scene.xray, crate::gpu::TRI_SIZE, quiet.removed), 0, "no see-through cut");
+        assert_eq!(count(&b.scene, &b.scene.ghost, crate::gpu::TRI_SIZE, quiet.removed), 0, "no ghost of the old shape");
+        assert!(count(&b.scene, &b.scene.tris, crate::gpu::TRI_SIZE, quiet.body) > 0, "the body is still drawn");
         // The tool of a cut is left out too, its outline alone showing where it goes.
         let cmds = [("solid.box".to_string(), json!({"length": 10, "width": 10, "height": 30, "operation": "new"}))];
         let p = s.preview(&cmds).unwrap();
         let shown = build_tool(&p.before, &p.after, plain, "cut");
-        assert!(count(&shown.scene, &shown.scene.xray, 28, plain.removed) > 0, "the tool is see-through red while the tint is on");
+        assert!(count(&shown.scene, &shown.scene.xray, crate::gpu::TRI_SIZE, plain.removed) > 0, "the tool is see-through red while the tint is on");
         let b = build_tool(&p.before, &p.after, quiet, "cut");
-        assert_eq!(count(&b.scene, &b.scene.xray, 28, quiet.removed), 0, "no see-through tool");
+        assert_eq!(count(&b.scene, &b.scene.xray, crate::gpu::TRI_SIZE, quiet.removed), 0, "no see-through tool");
         assert!(!b.scene.overlay.is_empty(), "the tool's outline still shows where the cut goes");
     }
 
@@ -1520,7 +1520,7 @@ mod tests {
         let b = compute(&s, &[("solid.fillet".into(), json!({"edges": [[-16, -20, 30]], "radius": 4}))], colors()).unwrap();
         assert_eq!(b.replaced, vec!["Body1".to_string()]);
         // Ghost triangles on the boss's side, well away from the fillet.
-        let on_boss = b.scene.ghost.as_chunks::<28>().0.as_chunks::<3>().0.iter().filter(|t| {
+        let on_boss = b.scene.ghost.as_chunks::<{ crate::gpu::TRI_SIZE }>().0.as_chunks::<3>().0.iter().filter(|t| {
             t.iter().all(|v| {
                 let f = |k: usize| f32::from_le_bytes([v[4 * k], v[4 * k + 1], v[4 * k + 2], v[4 * k + 3]]) as f64;
                 let (x, y, z) = (f(0), f(1), f(2));

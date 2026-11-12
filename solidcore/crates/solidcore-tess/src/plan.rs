@@ -71,6 +71,46 @@ pub(crate) struct FaceNodes {
     pub(crate) failure: Option<String>,
 }
 
+/// Most rings of neighbours an unknown curvature is filled from ([`fill_curvature`]); past
+/// them it stays unknown.
+const FILL_RINGS: usize = 4;
+
+/// Each unknown curvature (a singular point's: a pole has no tangent plane to bend from) as the
+/// mean of the known ones of the vertices it shares a triangle with, ring by ring out from the
+/// known ones: the map then shades a pole's triangles as their other corners are, not from how
+/// their normals turn on screen.
+fn fill_curvature(curvature: &mut [f32], triangles: &[[u32; 3]]) {
+    let known = |c: f32| c >= 0.0;
+    for _ in 0..FILL_RINGS {
+        let mut sum = vec![(0.0f64, 0usize); curvature.len()];
+        for t in triangles {
+            for &i in t {
+                for &j in t {
+                    if let (Some(&ci), Some(&cj), Some(acc)) = (
+                        curvature.get(i as usize),
+                        curvature.get(j as usize),
+                        sum.get_mut(i as usize),
+                    ) && !known(ci)
+                        && known(cj)
+                    {
+                        *acc = (acc.0 + f64::from(cj), acc.1 + 1);
+                    }
+                }
+            }
+        }
+        let mut filled = false;
+        for (c, (total, n)) in curvature.iter_mut().zip(sum) {
+            if !known(*c) && n > 0 {
+                *c = (total / n as f64) as f32;
+                filled = true;
+            }
+        }
+        if !filled {
+            break;
+        }
+    }
+}
+
 impl TessPlan {
     /// Face `f`'s node positions and normals as [`TessPlan::evaluate`] gives them, before its
     /// pole rules: each node evaluated on the face's surface (a shared edge node's own point
@@ -146,6 +186,15 @@ impl TessPlan {
                 });
                 continue;
             }
+            // Each node's exact curvature for the curvature map, unknown at a singular point.
+            let mut curvature: Vec<f32> =
+                f.uv.iter()
+                    .map(|uv| {
+                        surface
+                            .and_then(|s| s.curvature(uv[0], uv[1]))
+                            .map_or(crate::UNKNOWN_CURVATURE, |k| k as f32)
+                    })
+                    .collect();
             // At the poles of higher order the plan names: one copy per triangle with its limit
             // normal, or the mean of the triangles' normals, by the kernel's evaluator.
             let mut triangles = std::borrow::Cow::Borrowed(&f.triangles);
@@ -159,9 +208,16 @@ impl TessPlan {
                     .filter(|&k| k < f.fixed.len())
                     .collect();
                 let k = kernel.get_or_insert_with(|| crate::mesher::poles::kernel_form(s));
-                match crate::pole::apply(k, f, &at_poles, positions.clone(), normals.clone()) {
-                    Ok((p, n, t)) => {
-                        (positions, normals) = (p, n);
+                match crate::pole::apply(
+                    k,
+                    f,
+                    &at_poles,
+                    positions.clone(),
+                    normals.clone(),
+                    curvature.clone(),
+                ) {
+                    Ok((p, n, c, t)) => {
+                        (positions, normals, curvature) = (p, n, c);
                         triangles = std::borrow::Cow::Owned(t);
                     }
                     // A normal the rule cannot give refuses the face, nothing substituted.
@@ -175,8 +231,11 @@ impl TessPlan {
                 }
             }
             let nodes = positions.len();
+            curvature.resize(nodes, crate::UNKNOWN_CURVATURE);
+            fill_curvature(&mut curvature, &triangles);
             out.positions.extend(positions);
             out.normals.extend(normals);
+            out.curvature.extend(curvature);
             for t in triangles.iter() {
                 if t.iter().all(|&i| (i as usize) < nodes) {
                     let at = |i: u32| u32::try_from(base + i as usize).unwrap_or(u32::MAX);

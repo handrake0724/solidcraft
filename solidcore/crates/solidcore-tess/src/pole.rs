@@ -218,7 +218,7 @@ pub(crate) fn averaged_normal(
 }
 
 /// A face's vertex positions, their normals, and its triangles on them.
-pub(crate) type FaceVertices = (Vec<Vec3>, Vec<Vec3>, Vec<[u32; 3]>);
+pub(crate) type FaceVertices = (Vec<Vec3>, Vec<Vec3>, Vec<f32>, Vec<[u32; 3]>);
 
 /// Face `f`'s vertices at its pole nodes `at_poles` (evaluated to no normal, each named in the
 /// plan) given their normals, from the face's evaluated `positions` and `normals` (oriented):
@@ -232,6 +232,7 @@ pub(crate) fn apply(
     at_poles: &[usize],
     mut positions: Vec<Vec3>,
     mut normals: Vec<Vec3>,
+    mut curvature: Vec<f32>,
 ) -> Result<FaceVertices, String> {
     let sign = if f.flip { -1.0 } else { 1.0 };
     let names: Vec<u32> = f.poles.iter().map(|p| p.node).collect();
@@ -270,19 +271,32 @@ pub(crate) fn apply(
                 .map_err(|_| format!("its vertices lie past the mesh's {} index", u32::MAX))?;
             positions.push(positions.get(k as usize).copied().unwrap_or_default());
             normals.push(n * sign);
+            curvature.push(
+                curvature
+                    .get(k as usize)
+                    .copied()
+                    .unwrap_or(crate::UNKNOWN_CURVATURE),
+            );
             *c = copy;
         }
     }
     // Renumber without the replaced nodes.
     let mut index: Vec<u32> = Vec::new();
-    let (mut kept_p, mut kept_n) = (Vec::new(), Vec::new());
-    for (k, (p, n)) in positions.into_iter().zip(normals).enumerate() {
+    let (mut kept_p, mut kept_n, mut kept_k) = (Vec::new(), Vec::new(), Vec::new());
+    curvature.resize(positions.len(), crate::UNKNOWN_CURVATURE);
+    for (k, ((p, n), c)) in positions
+        .into_iter()
+        .zip(normals)
+        .zip(curvature)
+        .enumerate()
+    {
         let i = u32::try_from(kept_p.len())
             .map_err(|_| format!("its vertices lie past the mesh's {} index", u32::MAX))?;
         index.push(i);
         if !gone.get(k).copied().unwrap_or(false) {
             kept_p.push(p);
             kept_n.push(n);
+            kept_k.push(c);
         }
     }
     for t in &mut triangles {
@@ -290,5 +304,5 @@ pub(crate) fn apply(
             *c = index.get(*c as usize).copied().unwrap_or(u32::MAX);
         }
     }
-    Ok((kept_p, kept_n, triangles))
+    Ok((kept_p, kept_n, kept_k, triangles))
 }

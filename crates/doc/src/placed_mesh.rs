@@ -141,6 +141,8 @@ impl PlacedMesh {
             seams: source.seams.clone(),
             smooth_edges: source.smooth_edges.clone(),
             sharp_edges: source.sharp_edges.clone(),
+            // A rigid move keeps the surface's curvature.
+            curvature: source.curvature.clone(),
         }
     }
 }

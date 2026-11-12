@@ -93,10 +93,7 @@ impl GroundAo {
         let normal = cam.from_frame(Vec3::Z).to_f32();
         let mut bytes = Vec::with_capacity(6 * super::TRI_SIZE);
         for i in [0, 1, 2, 0, 2, 3] {
-            for value in points[i].iter().chain(&normal) {
-                bytes.extend_from_slice(&value.to_le_bytes());
-            }
-            bytes.extend_from_slice(&0u32.to_le_bytes());
+            super::corner(&mut bytes, points[i], normal, solidcore_tess::UNKNOWN_CURVATURE, super::PaletteIndex(0));
         }
         bytes
     }

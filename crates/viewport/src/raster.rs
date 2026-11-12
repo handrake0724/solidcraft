@@ -411,6 +411,7 @@ mod tests {
             smooth_edges: vec![],
             sharp_edges: vec![],
             edge_faces: vec![],
+            curvature: vec![],
         };
         let scene = Scene {
             meshes: vec![SceneMesh::solid(Arc::new(mesh), Rgb(200, 30, 30))],
