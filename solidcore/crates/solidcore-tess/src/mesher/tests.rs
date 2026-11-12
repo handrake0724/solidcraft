@@ -523,3 +523,53 @@ fn a_sliver_whose_vertices_come_twice_is_still_drawn() {
     }
 }
 
+
+/// A ship's flat of bottom near the bow: a flat ruled spline from the keel line (v = 0) to the
+/// flat's edge (v = 1), 2.6 m wide at its aft end and narrowing to a few centimetres over most of
+/// its 52 m before closing to a point (its last side collapsed, left out of the loop). Triangles
+/// straight in (u, v) between nodes far apart along it reached past the narrow part within the
+/// plane, over the bilge beside it (no sag across a plane sees that): the triangles cover the
+/// face once, inside its boundary, in its plane.
+#[test]
+fn a_flat_spline_narrowing_to_a_point_is_covered_once_inside_its_boundary() {
+    let xs = [0.0, 8000.0, 17000.0, 26000.0, 35000.0, 44000.0, 52000.0];
+    let widths = [2600.0, 1400.0, 300.0, 150.0, 120.0, 80.0, 0.0];
+    let mut ctrl = Vec::new();
+    for j in 0..2 {
+        for (x, w) in xs.iter().zip(widths) {
+            ctrl.push([*x, if j == 0 { 0.0 } else { w }, 0.0, 1.0]);
+        }
+    }
+    let knots = [vec![0., 0., 0., 0., 0.25, 0.5, 0.75, 1., 1., 1., 1.], vec![0., 0., 1., 1.]];
+    let s = EvalSurface::nurbs([3, 1], knots, [7, 2], ctrl);
+    assert!(s.flat().is_some());
+    // Keel line forward, the flat's edge aft from the point, the aft side down to the keel.
+    let mut uv: Vec<[f64; 2]> = (0..=6).map(|k| [f64::from(k) / 6.0, 0.0]).collect();
+    uv.extend((0..=6).map(|k| [1.0 - f64::from(k) / 6.0, 1.0]));
+    uv.extend((1..4).map(|k| [0.0, 1.0 - f64::from(k) / 4.0]));
+    let pts: Vec<Vec3> = uv.iter().filter_map(|q| s.derivs(q[0], q[1]).map(|(p, _, _)| p)).collect();
+    assert_eq!(pts.len(), uv.len());
+    let rules = size::Rules::new(60.0, 230_000.0, None);
+    let size = size::face_size(&s, &uv::domain(&s), &rules);
+    let mut stats = PlanStats::default();
+    let l = seam::Loop { uv: uv.clone(), pts: pts.clone() };
+    let Ok(fp) = plan_face(0, "spline", &poles::Face::new(s.clone(), 0.0), std::slice::from_ref(&l), &rules, size, 10.0, &mut stats, Lenient::No) else {
+        panic!("planned")
+    };
+    let (mesh, refused) = TessPlan { surfaces: vec![s.clone()], faces: vec![FacePlan { surface: Some(0), ..fp }], ..TessPlan::default() }.evaluate();
+    assert!(refused.is_empty(), "{refused:?}");
+    // The boundary's own area (shoelace in the plane z = 0) is the triangles' area: no triangle
+    // reaches outside it or lies over another.
+    let outline: f64 = pts.iter().zip(pts.iter().cycle().skip(1)).map(|(a, b)| a.x * b.y - b.x * a.y).sum::<f64>() * 0.5;
+    let at = |i: u32| mesh.positions.get(i as usize).copied().unwrap_or_default();
+    let covered: f64 = mesh
+        .triangles
+        .iter()
+        .map(|t| {
+            let (a, b, c) = (at(t[0]), at(t[1]), at(t[2]));
+            let (u, v) = ([b.x - a.x, b.y - a.y, b.z - a.z], [c.x - a.x, c.y - a.y, c.z - a.z]);
+            0.5 * ((u[1] * v[2] - u[2] * v[1]).powi(2) + (u[2] * v[0] - u[0] * v[2]).powi(2) + (u[0] * v[1] - u[1] * v[0]).powi(2)).sqrt()
+        })
+        .sum();
+    assert!(outline > 0.0 && (covered - outline).abs() < 1e-6 * outline, "triangles {covered} mm² over a face of {outline} mm²");
+}

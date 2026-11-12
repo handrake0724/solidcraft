@@ -1340,8 +1340,20 @@ fn plan_face(
     };
     // Planar and curved faces alike: a structured grid where the boundary runs along the
     // parameter box (a rectangle, a cylinder half), a Coons grid on four corners, else Delaunay.
-    // The lenient fill is the constrained Delaunay alone: the caller names the face in the stats.
-    let (extra, triangles) = if lenient == Lenient::Yes {
+    // A flat spline (a ship's flat of bottom written as a ruled spline narrowing to a point) need
+    // not run evenly over its plane: a triangle straight in (u, v) can reach past the face's
+    // boundary within the plane, over its neighbour, where no sag measured across the surface
+    // sees it. Its boundary nodes are triangulated in the plane itself.
+    let in_plane = match s.flat() {
+        Some(n) if !seamed && lenient == Lenient::No => in_plane_fill([n.x, n.y, n.z], &fixed, &ranges),
+        _ => None,
+    };
+    let (extra, triangles) = if let Some(t) = in_plane.clone() {
+        stats.planar += 1;
+        (Vec::new(), t)
+    } else if lenient == Lenient::Yes {
+        // The lenient fill is the constrained Delaunay alone: the caller names the face in the
+        // stats.
         delaunay()?
     } else {
         let mut us = uv::divide(s, 0, bbox[0], bbox[1], rules, h, MAX_LINES);
@@ -1453,8 +1465,9 @@ fn plan_face(
     }
     let mut all = uvs;
     all.extend(extra);
-    // Whatever the layout, no triangle leaves the surface by more than the tolerance.
-    if !planar {
+    // Whatever the layout, no triangle leaves the surface by more than the tolerance (a flat
+    // face triangulated in its plane lies on it).
+    if !planar && in_plane.is_none() {
         // Which nodes are poles, asked once per node over both passes.
         let poles = sag::Poles::new(s, reach);
         if sag::refine(s, tol, &poles, &fixed, &mut all, &mut triangles, MAX_REFINE) {
@@ -1472,6 +1485,37 @@ fn plan_face(
         *q = s.wrap(*q);
     }
     Ok(FacePlan { face: u32::try_from(fi).unwrap_or(u32::MAX), surface: None, uv: all, fixed: fixed.into_iter().map(kernel::record_vec3).collect(), normals: Vec::new(), flip: false, triangles, poles: Vec::new() })
+}
+
+/// The boundary nodes `fixed` of a flat face (loops `ranges`, counter-clockwise about `normal` as
+/// they are in (u, v)), triangulated in its plane, without points of their own: a plane is
+/// shaded the same by any triangles. `None` when the loops cannot be kept there (they cross in
+/// the plane), so the face takes the layouts in (u, v).
+fn in_plane_fill(normal: [f64; 3], fixed: &[Vec3], ranges: &[std::ops::Range<usize>]) -> Option<Vec<[u32; 3]>> {
+    let cross = |a: [f64; 3], b: [f64; 3]| [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+    let dot = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let unit = |a: [f64; 3]| {
+        let l = dot(a, a).sqrt();
+        (l.is_finite() && l > 0.0).then(|| a.map(|x| x / l))
+    };
+    let n = unit(normal)?;
+    let side = if n[0].abs() < 0.9 { [1.0, 0.0, 0.0] } else { [0.0, 1.0, 0.0] };
+    let e1 = unit(cross(side, n))?;
+    // e1 × e2 = n: counter-clockwise about the normal is counter-clockwise in (e1, e2).
+    let e2 = cross(n, e1);
+    let o = *fixed.first()?;
+    let xy: Vec<[f64; 2]> = fixed
+        .iter()
+        .map(|p| {
+            let d = [p.x - o.x, p.y - o.y, p.z - o.z];
+            [dot(d, e1), dot(d, e2)]
+        })
+        .collect();
+    let fill = cdt::Fill { seeds: &[], refine: None, shape: false, lenient: false, flat: None };
+    match cdt::triangulate(&xy, ranges, fill)? {
+        (extra, triangles) if extra.is_empty() && !triangles.is_empty() => Some(triangles),
+        _ => None,
+    }
 }
 
 /// A face's (u, v) region and what meshing it needs.
