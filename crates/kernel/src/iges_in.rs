@@ -1464,7 +1464,15 @@ fn orient(faces: &mut [FaceB]) {
     }
 }
 
+/// The colour of entity `seq`: a colour definition (314) it points to, or a colour number.
+/// Pure black reads as no colour: a black body shades as a flat silhouette, and exporters
+/// write black where the model has no colour of its own (a hull exported with every face
+/// pointing at one `RGB(0,0,0)` definition), so such a body takes the default colour.
 fn color_of(t: &Tr, seq: i64) -> Option<[f32; 3]> {
+    color_number(t, seq).filter(|c| c.iter().any(|&x| x > 0.0))
+}
+
+fn color_number(t: &Tr, seq: i64) -> Option<[f32; 3]> {
     let de = t.de(seq).ok()?;
     match de.color {
         c if c < 0 => {
