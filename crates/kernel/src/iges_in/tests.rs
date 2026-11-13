@@ -27,6 +27,20 @@ fn round_trip(b: &Body) -> crate::StepImport {
 }
 
 #[test]
+fn a_black_body_reads_as_one_without_colour() {
+    let b = box_solid(Vec3::ZERO, Vec3::new(10.0, 20.0, 30.0)).unwrap();
+    let black = ExportBody { name: "Hull".into(), body: &b, color: Some([0.0, 0.0, 0.0]) };
+    let text = iges_export_bodies(&[black], &StepHeader::default()).unwrap();
+    assert!(text.lines().any(|l| l.starts_with("314,")), "the export writes a colour definition");
+    let imp = iges_import(&text).unwrap();
+    assert_eq!(imp.bodies[0].color, None);
+    // a dark colour that is not pure black is kept
+    let navy = ExportBody { name: "Hull".into(), body: &b, color: Some([0.0, 0.0, 0.5]) };
+    let imp = iges_import(&iges_export_bodies(&[navy], &StepHeader::default()).unwrap()).unwrap();
+    assert_eq!(imp.bodies[0].color, Some([0.0, 0.0, 0.5]));
+}
+
+#[test]
 fn primitives_round_trip_through_iges() {
     round_trip(&box_solid(Vec3::ZERO, Vec3::new(10.0, 20.0, 30.0)).unwrap());
     round_trip(&cylinder(Vec3::new(1.0, 2.0, 3.0), Vec3::new(0.0, 1.0, 1.0), 5.0, 12.0).unwrap());
